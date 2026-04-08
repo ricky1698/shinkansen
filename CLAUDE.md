@@ -44,6 +44,11 @@
 - 每次修改 Extension 功能、UI、設定結構、檔案組織，**必須** 把 `manifest.json` 的 `version` +0.01
 - 格式是 **兩段式**：`0.13` → `0.14` → `0.15` …（不是 `0.1.13`）
 - Popup 顯示的版本號必須用 `chrome.runtime.getManifest().version` 動態讀取，**絕對不可寫死**在 HTML
+- **版本 bump 同步清單**（每次 bump 都必須全部更新，少一個測試就會 fail）：
+  1. `shinkansen/manifest.json` 的 `version`
+  2. `SPEC.md` 的「目前 Extension 版本」標頭
+  3. `SPEC.md` §2.1「已實作（v0.XX 為止）」標題
+  4. `test/edo-detection.spec.js` 的 `EXPECTED_VERSION` 常數（此常數是 forcing function，刻意設計成 bump 後不改就 fail，用來提醒測試期望值要跟著更新；不要為了讓測試過而動態讀 manifest 繞過它）
 
 ### 1.5 版本快照備份（Backup & Restore）
 
