@@ -113,6 +113,20 @@ function computeCostUSD(inputTokens, outputTokens, pricing) {
   return (inputTokens / 1_000_000) * inRate + (outputTokens / 1_000_000) * outRate;
 }
 
+/**
+ * v0.48: 計算套用 Gemini implicit context cache 折扣後的實付費用。
+ * Gemini 對 cache 命中部分只收原價 25%（省 75%），未命中部分與 output 全價。
+ * 公式：billed = ((inputTokens - cachedTokens) + cachedTokens × 0.25) × inRate / 1M
+ *             + outputTokens × outRate / 1M
+ */
+function computeBilledCostUSD(inputTokens, cachedTokens, outputTokens, pricing) {
+  const inRate = Number(pricing?.inputPerMTok) || 0;
+  const outRate = Number(pricing?.outputPerMTok) || 0;
+  const uncached = Math.max(0, inputTokens - cachedTokens);
+  const effectiveInput = uncached + cachedTokens * 0.25;
+  return (effectiveInput / 1_000_000) * inRate + (outputTokens / 1_000_000) * outRate;
+}
+
 // ─── Extension icon badge(已翻譯紅點提示） ─────────────────
 // 使用浮世繪圖示上的旭日紅 #cf3a2c，視覺上延續「太陽」的意象。
 const BADGE_COLOR = '#cf3a2c';
@@ -224,8 +238,11 @@ async function handleTranslate(payload, sender) {
 
   // 2. 缺的部分送 Gemini(透過 rate limiter 節流)
   let fresh = [];
-  let batchUsage = { inputTokens: 0, outputTokens: 0 };
+  let batchUsage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
   let batchCostUSD = 0;
+  // v0.48: hoist 到 if 外面，讓後面組 return usage 能讀到
+  let billedInputTokens = 0;
+  let billedCostUSD = 0;
   if (missingTexts.length) {
     // 先過 rate limiter 取得一個 slot(會自動等待到 RPM/TPM/RPD 都有餘裕)
     if (!limiter) await initLimiter();
@@ -247,7 +264,21 @@ async function handleTranslate(payload, sender) {
     // 3. 寫回快取
     await cache.setBatch(missingTexts, fresh);
     // 3.5 累計到全域使用量統計
-    await addUsage(batchUsage.inputTokens, batchUsage.outputTokens, batchCostUSD);
+    // v0.48: 改為累計「實付」值（套用 implicit cache 折扣後的等效 input tokens
+    // 與實付費用），讓 popup 累計顯示的 token / 費用等於 Gemini 帳單實際扣款。
+    // billedInputTokens = inputTokens - cachedTokens × 0.75
+    //   （未命中的 token 全價 + 命中的 token 25% 折扣 → 等效 token 數）
+    billedInputTokens = Math.max(
+      0,
+      Math.round(batchUsage.inputTokens - (batchUsage.cachedTokens || 0) * 0.75),
+    );
+    billedCostUSD = computeBilledCostUSD(
+      batchUsage.inputTokens,
+      batchUsage.cachedTokens || 0,
+      batchUsage.outputTokens,
+      settings.pricing,
+    );
+    await addUsage(billedInputTokens, batchUsage.outputTokens, billedCostUSD);
   }
 
   // 4. 合併結果（快取 + 新翻譯）按原順序回傳
@@ -258,9 +289,16 @@ async function handleTranslate(payload, sender) {
   return {
     result,
     usage: {
+      // 原始（未套 implicit cache 折扣）數字，保留給 content 端算 hit% / saved%
       inputTokens: batchUsage.inputTokens,
       outputTokens: batchUsage.outputTokens,
+      // Gemini implicit context cache 命中的輸入 token 數（v0.46 新增）。
+      // 注意這跟下面的 `cacheHits`(本地 tc_<sha1> 翻譯快取命中段數) 是兩回事。
+      cachedTokens: batchUsage.cachedTokens || 0,
       costUSD: batchCostUSD,
+      // v0.48: 套 implicit cache 折扣後的「實付」數字。toast 與 popup 都顯示這組
+      billedInputTokens,
+      billedCostUSD,
       cacheHits,
     },
   };

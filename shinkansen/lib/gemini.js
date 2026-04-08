@@ -128,12 +128,20 @@ async function fetchWithRetry(url, body, { maxRetries = 3 } = {}) {
  * 批次翻譯文字陣列（會自動切成多批送出）。
  * @param {string[]} texts 原文陣列
  * @param {object} settings 完整設定
- * @returns {Promise<{ translations: string[], usage: { inputTokens: number, outputTokens: number } }>}
+ * @returns {Promise<{ translations: string[], usage: { inputTokens: number, outputTokens: number, cachedTokens: number } }>}
+ *
+ * 註：`cachedTokens` 來自 Gemini API 回應的 `usageMetadata.cachedContentTokenCount`，
+ * 代表本次輸入中被 Gemini implicit context cache 命中的 token 數。
+ * 命中的部分 Gemini 會以全價 25% 計費（2.5 系列 Flash/Pro 預設開啟 implicit cache，
+ * 命中條件是 prompt 前綴穩定且達到最低門檻：Flash ~1024、Pro ~2048）。
+ * 這個數字跟 `lib/cache.js` 的本地 `tc_<sha1>` 翻譯快取是不同概念 ——
+ * 本地快取命中的段落根本不會送 API，而 implicit cache 命中的段落有送 API
+ * 但前綴（system prompt 那一大段）被 Gemini 內部 cache 省下。
  */
 export async function translateBatch(texts, settings) {
-  if (!texts?.length) return { translations: [], usage: { inputTokens: 0, outputTokens: 0 } };
+  if (!texts?.length) return { translations: [], usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 } };
   const out = new Array(texts.length);
-  const usage = { inputTokens: 0, outputTokens: 0 };
+  const usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
   const chunks = packChunks(texts);
   for (const { start, end } of chunks) {
     const slice = texts.slice(start, end);
@@ -141,6 +149,7 @@ export async function translateBatch(texts, settings) {
     for (let j = 0; j < parts.length; j++) out[start + j] = parts[j];
     usage.inputTokens += u.inputTokens;
     usage.outputTokens += u.outputTokens;
+    usage.cachedTokens += u.cachedTokens || 0;
   }
   return { translations: out, usage };
 }
@@ -213,6 +222,9 @@ async function translateChunk(texts, settings) {
   const chunkUsage = {
     inputTokens: meta.promptTokenCount || 0,
     outputTokens: meta.candidatesTokenCount || 0,
+    // Gemini 2.5+ implicit context caching 命中的 token 數（輸入 tokens 的子集）。
+    // 未命中或舊模型時欄位不會出現，用 || 0 防呆。
+    cachedTokens: meta.cachedContentTokenCount || 0,
   };
   await debugLog('info', 'gemini response', {
     ms,
@@ -240,6 +252,7 @@ async function translateChunk(texts, settings) {
       aligned.push(r.parts[0] || '');
       aggUsage.inputTokens += r.usage.inputTokens;
       aggUsage.outputTokens += r.usage.outputTokens;
+      aggUsage.cachedTokens += r.usage.cachedTokens || 0;
     }
     return { parts: aligned, usage: aggUsage };
   }

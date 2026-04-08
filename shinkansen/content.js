@@ -55,6 +55,9 @@
         color: #6e6e73;
         font-variant-numeric: tabular-nums;
         margin-top: -2px;
+        /* v0.48: detail 支援多行顯示（tokens 一行、費用一行） */
+        white-space: pre-line;
+        line-height: 1.4;
       }
       .detail[hidden] { display: none; }
       .timer {
@@ -120,6 +123,17 @@
   // 待定的 hide setTimeout；後續任何 showToast 都會清掉它，
   // 避免舊 toast 的 autoHide 把新 toast 也一起關掉。
   let toastHideHandle = null;
+  // v0.47: 「點擊外部關閉」的 mousedown listener handle。
+  // 在 success 狀態且非 autoHide 時註冊（翻譯完成的主 toast），
+  // hideToast / 下一次 showToast 時都要清掉。
+  let toastOutsideHandler = null;
+
+  function removeOutsideClickHandler() {
+    if (toastOutsideHandler) {
+      document.removeEventListener('mousedown', toastOutsideHandler, true);
+      toastOutsideHandler = null;
+    }
+  }
 
   function formatElapsed(ms) {
     const s = Math.floor(ms / 1000);
@@ -153,6 +167,8 @@
       clearTimeout(toastHideHandle);
       toastHideHandle = null;
     }
+    // v0.47: 也清掉前一次遺留的 outside-click listener,避免重疊註冊。
+    removeOutsideClickHandler();
 
     // 組合 class
     const classes = ['toast', 'show', kind];
@@ -201,6 +217,30 @@
         hideToast();
       }, opts.autoHideMs);
     }
+
+    // v0.47: 「翻譯完成」主 toast（kind === 'success' 且沒有 autoHideMs）
+    // 註冊「點擊外部區域即關閉」的 listener。
+    // - 排除 autoHide 情境:避免「已還原原文」這種 2 秒自動消失的 toast
+    //   也被外部點擊搶先關掉,而且它本來就是次要提示。
+    // - 用 mousedown + capture 比 click 更早觸發,避免使用者點別處的
+    //   同時頁面 handler 吃掉事件。
+    // - composedPath 判斷是否點在 toastHost 內部(含 shadow DOM)。
+    //   若在內部(例如點 toast 本體 / × 按鈕)則不處理,交給原本邏輯。
+    // - 延遲到下個 tick 再註冊,避免觸發 showToast 的那次 mousedown
+    //   (如果真的是 click 觸發的話)立刻命中 listener 把自己關掉。
+    //   目前 showToast 幾乎都由快捷鍵觸發,但保險起見還是延遲。
+    if (kind === 'success' && !opts.autoHideMs) {
+      setTimeout(() => {
+        // 若在延遲期間 toast 已被關掉或被新 toast 取代,就不註冊。
+        if (!toastEl.className.includes('show')) return;
+        toastOutsideHandler = (ev) => {
+          const path = ev.composedPath ? ev.composedPath() : [];
+          if (path.includes(toastHost)) return; // 點在 toast 內部,忽略
+          hideToast();
+        };
+        document.addEventListener('mousedown', toastOutsideHandler, true);
+      }, 0);
+    }
   }
   function hideToast() {
     toastEl.className = 'toast';
@@ -211,6 +251,8 @@
       clearTimeout(toastHideHandle);
       toastHideHandle = null;
     }
+    // v0.47: 關閉時一併移除 outside-click listener,避免遺留監聽。
+    removeOutsideClickHandler();
   }
 
   // ─── 段落偵測 （v0.1 通用規則） ─────────────────────────
@@ -1002,7 +1044,13 @@
     } catch (_) { /* 保持 default */ }
 
     let done = 0;
-    const pageUsage = { inputTokens: 0, outputTokens: 0, costUSD: 0, cacheHits: 0 };
+    // cachedTokens: Gemini implicit context cache 命中的輸入 token 累計（v0.46 新增）
+    // billedInputTokens / billedCostUSD: 套 implicit cache 折扣後的實付值（v0.48 新增）
+    const pageUsage = {
+      inputTokens: 0, outputTokens: 0, cachedTokens: 0, costUSD: 0,
+      billedInputTokens: 0, billedCostUSD: 0,
+      cacheHits: 0,
+    };
     const jobs = packBatches(texts, units, slotsList);
     const failures = [];
 
@@ -1017,7 +1065,10 @@
         if (response.usage) {
           pageUsage.inputTokens += response.usage.inputTokens || 0;
           pageUsage.outputTokens += response.usage.outputTokens || 0;
+          pageUsage.cachedTokens += response.usage.cachedTokens || 0;
           pageUsage.costUSD += response.usage.costUSD || 0;
+          pageUsage.billedInputTokens += response.usage.billedInputTokens || 0;
+          pageUsage.billedCostUSD += response.usage.billedCostUSD || 0;
           pageUsage.cacheHits += response.usage.cacheHits || 0;
         }
         translations.forEach((tr, j) => injectTranslation(job.units[j], tr, job.slots[j]));
@@ -1073,10 +1124,48 @@
         const successMsg = `翻譯完成 （${total} 段）`;
         let detail;
         if (totalTokens > 0) {
-          detail = `${formatTokens(totalTokens)} tokens · ${formatUSD(pageUsage.costUSD)}`;
+          // v0.48: Toast 顯示「實付」值（已套 Gemini implicit cache 折扣）。
+          //   Line 1: `{billed tokens} tokens (XX% hit)`
+          //   Line 2: `${billed USD} (XX% saved)`
+          // - billed tokens = billedInputTokens + outputTokens（等效 token 數）
+          // - hit%  = cachedTokens / inputTokens × 100  (input 層的 cache 命中比例)
+          // - saved% = (原價 − 實付) / 原價 × 100         (費用層的節省比例，
+          //            output 沒折扣所以會比 hit% 略低)
+          // - 若 cachedTokens === 0 則不附加括號內容（避免 0% hit / 0% saved 刺眼）
+          const billedTotalTokens = pageUsage.billedInputTokens + pageUsage.outputTokens;
+          let line1 = `${formatTokens(billedTotalTokens)} tokens`;
+          let line2 = formatUSD(pageUsage.billedCostUSD);
+          if (pageUsage.cachedTokens > 0 && pageUsage.inputTokens > 0) {
+            const hitPct = (pageUsage.cachedTokens / pageUsage.inputTokens) * 100;
+            const savedPct = pageUsage.costUSD > 0
+              ? ((pageUsage.costUSD - pageUsage.billedCostUSD) / pageUsage.costUSD) * 100
+              : 0;
+            line1 += ` (${hitPct.toFixed(0)}% hit)`;
+            line2 += ` (${savedPct.toFixed(0)}% saved)`;
+          }
+          // 用 \n 分隔兩行，依靠 CSS `.detail { white-space: pre-line }` 正確換行
+          detail = `${line1}\n${line2}`;
         } else if (pageUsage.cacheHits === total) {
           detail = '全部快取命中 · 本次未計費';
         }
+        // 把完整 usage 印到 console，方便事後在 DevTools 查實際數字（v0.48 更新欄位）
+        console.log('[Shinkansen] page usage', {
+          segments: total,
+          inputTokens: pageUsage.inputTokens,
+          cachedTokens: pageUsage.cachedTokens,
+          outputTokens: pageUsage.outputTokens,
+          billedInputTokens: pageUsage.billedInputTokens,
+          billedTotalTokens: pageUsage.billedInputTokens + pageUsage.outputTokens,
+          implicitCacheHitRate: pageUsage.inputTokens > 0
+            ? `${((pageUsage.cachedTokens / pageUsage.inputTokens) * 100).toFixed(1)}%`
+            : 'n/a',
+          originalCostUSD: pageUsage.costUSD,
+          billedCostUSD: pageUsage.billedCostUSD,
+          costSavedRate: pageUsage.costUSD > 0
+            ? `${(((pageUsage.costUSD - pageUsage.billedCostUSD) / pageUsage.costUSD) * 100).toFixed(1)}%`
+            : 'n/a',
+          localCacheHitSegments: pageUsage.cacheHits,
+        });
         showToast('success', successMsg, {
           progress: 1,
           stopTimer: true,
@@ -1143,13 +1232,19 @@
         const { done, failures } = await translateUnits(newUnits);
         // 離開 await 後再次檢查:rescan 期間使用者可能已按還原
         if (!STATE.translated) return;
-        if (done > 0 && failures.length === 0) {
-          showToast('success', `補抓 ${done} 段新內容`, {
-            progress: 1,
-            autoHideMs: 3000,
+        // v0.47: 不再顯示「補抓 X 段新內容」toast。
+        // 原因:翻譯完成後的主 toast 帶著 token / 費用 / 快取命中率等
+        // 使用者真正在意的統計資料,若補抓 toast 在幾秒後蓋掉它,使用者
+        // 就看不到統計。補抓本身是自動機制,使用者不需要主動知道,
+        // 改成只 console.log 讓需要的人自己去 DevTools 看。
+        // 失敗原本就靜默(console.warn 在 translateUnits 內做),成功比照辦理。
+        if (done > 0) {
+          console.log('[Shinkansen] rescan 補抓', {
+            done,
+            failures: failures.length,
+            attempt: rescanAttempts + 1,
           });
         }
-        // 有 failures 也靜默;console.warn 已在 translateUnits 內做了
       } catch (err) {
         console.warn('[Shinkansen] rescan failed', err);
       }
