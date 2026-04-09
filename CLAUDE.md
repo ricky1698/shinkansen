@@ -48,7 +48,7 @@
   1. `shinkansen/manifest.json` 的 `version`
   2. `SPEC.md` 的「目前 Extension 版本」標頭
   3. `SPEC.md` §2.1「已實作（v0.XX 為止）」標題
-  4. `test/edo-detection.spec.js` 的 `EXPECTED_VERSION` 常數（此常數是 forcing function，刻意設計成 bump 後不改就 fail，用來提醒測試期望值要跟著更新；不要為了讓測試過而動態讀 manifest 繞過它）
+  4. `test/version-check.spec.js` 的 `EXPECTED_VERSION` 常數（此常數是 forcing function，刻意設計成 bump 後不改就 fail，用來提醒測試期望值要跟著更新；不要為了讓測試過而動態讀 manifest 繞過它。v0.59 起從原本的 `test/edo-detection.spec.js` 搬到獨立檔，因為 edo-detection 被 regression suite 取代後刪掉了）
 
 ### 1.5 版本快照備份（Backup & Restore）
 
