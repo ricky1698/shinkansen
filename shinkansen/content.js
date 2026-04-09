@@ -1889,6 +1889,25 @@
     // 測試驗證巢狀 `⟦N⟧…⟦/N⟧` 的 round-trip 行為。不觸發任何 API 呼叫。
     serialize(el) { return serializeWithPlaceholders(el); },
     deserialize(text, slots) { return deserializeWithPlaceholders(text, slots); },
+    // 測試專用 (v0.59 新增):對指定 element 跑「serialize → 假 LLM 回應 →
+    // inject」的完整路徑,跳過網路層但保留所有真實的 serialize/deserialize/
+    // resolveWriteTarget/injectIntoTarget 邏輯。讓 Category B 回歸測試能夠
+    // 對 v0.49–v0.58 修過的 inject 路徑 bug 做斷言,而不需要打 Gemini API。
+    // 不污染 page main world (留在 isolated world)。
+    testInject(el, translation) {
+      if (!el || el.nodeType !== Node.ELEMENT_NODE) {
+        throw new Error('testInject: el must be an Element');
+      }
+      const { text, slots } = serializeWithPlaceholders(el);
+      const unit = { kind: 'element', el };
+      injectTranslation(unit, translation, slots);
+      return { sourceText: text, slotCount: slots.length };
+    },
+    // 測試專用 (v0.59 新增):暴露 selectBestSlotOccurrences 給 Category C
+    // 純函式測試呼叫(slot dup graceful degradation 的 winner 選擇邏輯)。
+    selectBestSlotOccurrences(text) {
+      return selectBestSlotOccurrences(text);
+    },
     // 當前翻譯狀態快照
     getState() {
       return {
