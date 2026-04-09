@@ -30,8 +30,9 @@
 1. 讀本檔（`CLAUDE.md`）了解協作規則
 2. 讀 `SPEC.md` 了解專案全貌、已完成功能、待辦事項
 3. 讀 `shinkansen/manifest.json` 確認目前版本號
-4. 視任務需要讀相關 source（`content.js`、`background.js`、`lib/*.js` 等）
-5. 再動手
+4. 讀 `test/PENDING_REGRESSION.md`：**若該檔案非空（除了 header 外有任何待辦條目）**，第一句話必須主動提醒 Jimmy「目前 pending regression queue 還有 N 條未清，要不要先處理？」這條提醒不可省略，也不可放在回應後段——因為 Jimmy 不是工程師，看不到檔案內容變化，需要 Claude 主動代他注意這個技術債
+5. 視任務需要讀相關 source（`content.js`、`background.js`、`lib/*.js` 等）
+6. 再動手
 
 **絕對不要** 憑記憶或猜測就動手改，因為新對話的 Claude 沒有前一次對話的上下文。
 
@@ -132,6 +133,26 @@
 - **找不到通用規則時的正確反應**：**停下來追問根因**，不要先加一個可以矇過當下測試頁的特判。寧可花時間看 DOM、用 Chrome MCP 實地診斷，也不要為了「這個頁面先修好」留下特判技術債。特判會在下一個類似結構的網站上再炸一次，而且屆時很難追查。
 - **舊路徑也要跟著更新**：遇到某個注入路徑的 bug 時，要主動檢查「其他類似路徑是不是也有同樣的 pattern 問題」。例如 v0.54 修 `replaceNodeInPlace` 時應該一併檢查 `plainTextFallback` 與 `replaceTextInPlace` 有沒有共用同一個「寫入目標解析」邏輯——三條路徑不該各自實作自己的 MJML 檢測。共用 helper 才能確保下次 MJML 排版變種不會在其中一條路徑先炸。
 - **歷史教訓**：v0.51–v0.53 三輪都試圖修 Wikipedia ambox，前兩輪（serialize normalize、slot dedup + plainTextFallback）都是把新規則當 edge case 在疊，沒有回頭審視 `replaceNodeInPlace` 這個**通用 injection 路徑**的根本問題。v0.54 才是真正的通則（「fragment 由 slots 重建，正常情況整段覆蓋就對了」），但三條注入路徑當時沒統一，v0.55 才補上。往後遇到注入 / 段落偵測 / 序列化相關 bug，先問「是不是所有同類路徑都需要一起改」。
+
+### 9. 修 shinkansen bug 必須同步寫 regression 測試（不可累積技術債）
+
+- **背景**：v0.59 起 `test/regression/` 已有 10 條 spec 鎖死 v0.49–v0.58 期間踩過的 bug。但 Jimmy 反覆測試的網頁不到 10 個,他平常會把新發現的排版/翻譯問題丟進 Cowork 對話讓 Claude 修。問題是 bug 修了之後若沒有當場補 regression 測試,新 bug 就會在下一輪改動時悄悄回來,而 Jimmy(非工程師)不會自己去檢查 `test/regression/` 是否同步。
+- **強制規則**：每次在 `shinkansen/` 內修 bug + bump 版本號的同一輪對話,**必須**選下面其中一條路徑:
+  - **路徑 A(首選)**：在同一輪編輯把 regression spec + fixture HTML + canned response 一起寫進 `test/regression/`。Cowork 可以寫完整的 spec(只是文字檔編輯),sanity check 留一行 HTML 註解 `<!-- SANITY-PENDING: 描述要破壞哪個 fix 來驗證 -->`,等切到 Claude Code 端再實際跑驗證後拿掉。
+  - **路徑 B(fallback)**：若當下抽不出最小重現結構(例如真實頁面太複雜、不確定 bug 的觸發條件),在 `test/PENDING_REGRESSION.md` 加一筆條目。**絕對不可以兩條都不做**。
+- **判斷要走 A 還是 B**：
+  - 已經有清楚的最小結構(知道哪個 tag 配什麼 attribute 會炸) → 走 A
+  - 還在「這個頁面 LLM 翻得怪怪的,但不知道哪個結構是元兇」 → 走 B,先把現象記下來,等下次再追根因
+  - 有疑慮就走 B,**不要為了走 A 而硬寫一條斷言模糊的 spec** —— 測試本身的品質比覆蓋率重要
+- **路徑 A 的最小流程**(Cowork 端能做到的範圍)：
+  1. 修 `shinkansen/` 程式碼
+  2. 在 `test/regression/fixtures/` 建 `<bug-name>.html` 與 `<bug-name>.response.txt`
+  3. 在 `test/regression/` 建 `inject-<bug-name>.spec.js` 或 `detect-<bug-name>.spec.js`,參照已有 spec 的格式
+  4. spec 檔案頂部用 HTML 註解 `<!-- SANITY-PENDING: ... -->` 標記,告訴 Claude Code 端「跑 sanity check 時要破壞什麼」
+  5. bump 版本號 + 更新 SPEC changelog,告知 Jimmy「你下次到 Claude Code 端時記得跑 npm test + 完成 sanity check」
+- **路徑 B 的條目格式**：見 `test/PENDING_REGRESSION.md` 自己的範例。
+- **Cowork 在宣告任務完成之前必須自我檢查**：「我有修 `shinkansen/` 嗎?有的話我有走 A 或 B 嗎?」沒有的話不能說任務完成。
+- **為什麼要這條規則**：上一次 v0.49–v0.58 連 10 個 bug 沒有對應測試,事後補 regression suite 花了一整輪對話 + 大量 sanity check。若當時每次修 bug 都當場補測試,成本是 1+1 而不是 N+1,且不會留下任何「我這次改動會不會踩到舊 bug」的不確定性。
 
 ---
 
