@@ -628,6 +628,20 @@
           // Wikipedia infobox TH 裡內嵌的 .mw-parser-output {...} CSS
           // 會被當成純文字送進 LLM。
           if (HARD_EXCLUDE_TAGS.has(child.tagName)) continue;
+          // v0.50: <br> 在 MJML / Mailjet / Mailchimp 等 HTML email 模板裡
+          // 是「段落分隔符」（範本沒有 <p>，多段內容用 <br><br><br> 分隔）。
+          // 序列化時把 <br> 還原成 \n，連續多個 <br> 就會變成 \n\n…，
+          // 後續的 whitespace normalization 會收斂成「最多一個空行」（\n\n）。
+          // 對一般網頁的單一 <br>（換行而非分段）也只是多一個 \n，不會破壞語意。
+          if (child.tagName === 'BR') {
+            // v0.51: 使用 sentinel \u0001 標記「來自 <br> 的換行」，
+            // 與 source HTML 文字節點裡的原生 \n 分開處理。
+            // 後面 normalize 階段會先把所有 whitespace（含原生 \n）收成 space，
+            // 再把 sentinel 還原成真正的 \n。這樣就避免 Wikipedia 之類網頁
+            // 從 source HTML formatting 帶進來的 \n 被誤當成段落分隔。
+            out += '\u0001';
+            continue;
+          }
           // 原子保留:整個元素 deep clone,只送 ⟦*N⟧ 給 LLM(裡面文字不翻譯)
           if (isAtomicPreserve(child)) {
             const idx = slots.length;
@@ -652,7 +666,21 @@
       }
     }
     walk(topLevelNodes);
-    return { text: out.replace(/\s+/g, ' ').trim(), slots };
+    // v0.51: 兩階段 normalization，把「真正的 <br> 換行」與「source HTML
+    // 排版用的 \n / 空白」分開處理。
+    //   1. 先把所有原生 whitespace（含 source 的 \n）收成單一 space —— 這
+    //      是 v0.50 之前的行為，能避免 Wikipedia 之類網頁的 source 排版
+    //      \n 被誤當成段落分隔。
+    //   2. 再處理 sentinel \u0001（來自 <br>）:吃掉 sentinel 兩側多餘空白,
+    //      連續 3+ 個收成兩個（= 保留一個空行 = 一個段落分隔）。
+    //   3. 最後把 sentinel 還原成真正的 \n。
+    const normalized = out
+      .replace(/\s+/g, ' ')
+      .replace(/ *\u0001 */g, '\u0001')
+      .replace(/\u0001{3,}/g, '\u0001\u0001')
+      .replace(/\u0001/g, '\n')
+      .trim();
+    return { text: normalized, slots };
   }
 
   /**
@@ -725,6 +753,37 @@
     // 再把 CJK 周圍黏在佔位符旁的殘留空白收掉
     translation = collapseCjkSpacesAroundPlaceholders(translation);
 
+    // v0.52: 偵測 LLM 把同一個 slot index 重複引用的結構性失敗。
+    // 真實案例:Wikipedia ambox（17 個 nested slot）翻完後 Gemini 會把整段
+    // 譯文塞進「最後一組」⟦I⟧⟦SMALL⟧⟦A⟧ 內部,並在裡面 re-use slot 0/1/2,
+    // 前面所有 slot 變成空殼,結果頁面變成「整段斜體 + 整段粗體 + 結構錯亂」。
+    // 偵測規則:每個開頭標記 ⟦N⟧ 在譯文中只能出現一次。若任何 N 出現多次,
+    // 認定 LLM 結構性失敗,直接回 ok=false 讓上層走 plain-text fallback
+    // (譯文還是會出現,只是失去 inline formatting,好過現在的視覺災難)。
+    {
+      const openRe = new RegExp(PH_OPEN + '(\\d+)' + PH_CLOSE, 'g');
+      const seen = new Set();
+      const allOpens = [];
+      let mm;
+      while ((mm = openRe.exec(translation)) !== null) {
+        allOpens.push(mm[1]);
+        if (seen.has(mm[1])) {
+          // 診斷用 log:確認 v0.52 偵測有跑到
+          console.warn('[Shinkansen v0.52] slot dup detected, slots=' + slots.length +
+            ' allOpens=' + JSON.stringify(allOpens) +
+            ' translation_preview=' + JSON.stringify(translation.slice(0, 200)));
+          return { frag: document.createDocumentFragment(), ok: false, matched: 0 };
+        }
+        seen.add(mm[1]);
+      }
+      // 診斷用:列出 slot 數 > 5 的 segment 經過了偵測
+      if (slots.length > 5) {
+        console.log('[Shinkansen v0.52] dedup pass slots=' + slots.length +
+          ' opens=' + allOpens.length +
+          ' translation_preview=' + JSON.stringify(translation.slice(0, 200)));
+      }
+    }
+
     // v0.32 起：recursive parse to support nested placeholders
     // （例如 ⟦0⟧一般文字 ⟦1⟧連結文字⟦/1⟧ 更多文字⟦/0⟧)。
     // parseSegment() 會用 regex 非貪婪匹配找最外層 ⟦N⟧...⟦/N⟧，
@@ -756,7 +815,18 @@
       if (!s) return;
       // 剝掉任何殘留的(不配對)佔位符標記,只留乾淨文字
       const clean = stripStrayPlaceholderMarkers(s);
-      if (clean) frag.appendChild(document.createTextNode(clean));
+      if (!clean) return;
+      // v0.50: 序列化階段把 <br> 轉成 \n,反序列化時還原成真正的 <br>。
+      // 連續多個 \n 會產出對應數量的 <br>(在 normalize 階段已限制最多兩個 = 一個空行）。
+      if (clean.includes('\n')) {
+        const parts = clean.split('\n');
+        for (let i = 0; i < parts.length; i++) {
+          if (parts[i]) frag.appendChild(document.createTextNode(parts[i]));
+          if (i < parts.length - 1) frag.appendChild(document.createElement('br'));
+        }
+      } else {
+        frag.appendChild(document.createTextNode(clean));
+      }
     }
 
     let cursor = 0;
@@ -1303,72 +1373,245 @@
     if (slots && slots.length > 0) {
       const { frag, ok } = deserializeWithPlaceholders(translation, slots);
       if (ok) {
-        el.textContent = '';
-        el.appendChild(frag);
+        // v0.49 bugfix：不能用 `el.textContent = ''; el.appendChild(frag)`，
+        // 原因跟 replaceTextInPlace 註解一樣——MJML 外層 TD 常設 font-size:0，
+        // 把 el 裡所有 child 清掉就等於丟掉內層 DIV/SPAN wrapper 提供的真字體大小，
+        // fragment 裡的 SPAN shell 只保留 font-family/color（沒有 font-size），
+        // 結果文字繼承 TD 的 0px → 整段看不見（Gmail MJML newsletter 的 step body
+        // 實測就是這條路徑觸發的 bug）。
+        // 改法：找最長的可見文字節點，把 fragment 插在它原位，再把它跟其他文字
+        // 節點清空。這樣 fragment 會落在 MJML inner wrapper 底下，自動繼承 16px。
+        replaceNodeInPlace(el, frag);
         el.setAttribute('data-shinkansen-translated', '1');
         return;
       }
-      // fallback：把譯文中的 ⟦N⟧⟦/N⟧ 標記去掉，當純文字塞回去
+      // fallback：把譯文中的 ⟦N⟧⟦/N⟧ 標記去掉,走 plain-text 替換。
+      //
+      // v0.52: 之前用 replaceTextInPlace 把譯文塞進「最長文字節點」,但對於
+      // Wikipedia ambox 這種「最長文字節點剛好在 <I><SMALL><A> 裡面」的
+      // 結構,Chinese 會繼承 italic/small/link 樣式,看起來像 v0.51 的失敗
+      // 視覺(雖然結構不再錯亂)。改用 plainTextFallback：直接寫到 el 本身
+      // 的 textContent,只在 MJML 之類「el 自己 font-size:0」的特殊情況下
+      // 才退到 inner wrapper,避免 ambox 的 inline ancestor 把樣式繼承下來。
+      // v0.52: 含 `\\*?` 才能順便清掉原子型佔位符 `⟦*N⟧`(像 Wikipedia
+      // sup.reference 腳註),不然這些 token 會以字面形式留在 fallback 文字裡。
       const cleaned = translation.replace(
-        new RegExp(PH_OPEN + '\\/?\\d+' + PH_CLOSE, 'g'),
+        new RegExp(PH_OPEN + '\\*?\\/?\\d+' + PH_CLOSE, 'g'),
         ''
       );
-      el.textContent = cleaned;
+      plainTextFallback(el, cleaned);
       el.setAttribute('data-shinkansen-translated', '1');
       return;
     }
 
-    if (containsMedia(el)) {
-      // 元素內含圖片/影片等媒體 → 用 text-node 替換策略，保留媒體不動
-      // 要同時跳過：
-      //   (1) <script>/<style>/<noscript>/<code>/<pre> 底下的文字節點
-      //   (2) CSS display:none / visibility:hidden 的隱形祖先底下的文字節點
-      // 歷史教訓 （v0.33 / v0.34）：Wikipedia 的 #coordinates 有兩個坑
-      //   (a) 內含 inline <style>（295 字元 CSS），比可見文字還長 → v0.33 用
-      //       HARD_EXCLUDE_TAGS 過濾修掉
-      //   (b) 同時含 .geo-dms（可見 DMS 格式）與 .geo-nondefault > .geo-dec
-      //       （隱形的十進制格式，display:none）。DMS 文字被切成 "Coordinates"
-      //       / "35°41′02″N" / "139°46′28″E" 多個短節點；.geo-dec 是一個長字串。
-      //       v0.33 過掉 STYLE 之後，剩下最長的反而是隱形的 .geo-dec，譯文又
-      //       塞進看不到的地方 → v0.34 加上 isVisible 過濾修掉
-      const textNodes = [];
-      const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
-        acceptNode(node) {
-          let p = node.parentElement;
-          while (p && p !== el) {
-            if (HARD_EXCLUDE_TAGS.has(p.tagName)) return NodeFilter.FILTER_REJECT;
-            const cs = p.ownerDocument?.defaultView?.getComputedStyle?.(p);
-            if (cs && (cs.display === 'none' || cs.visibility === 'hidden')) {
-              return NodeFilter.FILTER_REJECT;
-            }
-            p = p.parentElement;
-          }
-          return NodeFilter.FILTER_ACCEPT;
-        }
-      });
-      let n;
-      while ((n = walker.nextNode())) {
-        if (n.nodeValue && n.nodeValue.trim()) textNodes.push(n);
-      }
-      if (textNodes.length === 0) {
-        // 沒有獨立文字節點？附加在最後
-        el.appendChild(document.createTextNode(translation));
-      } else {
-        // 把整段譯文塞給最長的那個文字節點（主承載點），其餘清空
-        let main = textNodes[0];
-        for (const t of textNodes) {
-          if (t.nodeValue.length > main.nodeValue.length) main = t;
-        }
-        main.nodeValue = translation;
-        for (const t of textNodes) {
-          if (t !== main) t.nodeValue = '';
-        }
-      }
-    } else {
-      // 純文字元素：直接整段替換，保留元素本身的 font/size/color/layout
-      el.textContent = translation;
-    }
+    replaceTextInPlace(el, translation);
     el.setAttribute('data-shinkansen-translated', '1');
+  }
+
+  /**
+   * v0.49: 「最長文字節點就地替換」——把整段譯文塞給 el 底下最長的可見文字節點，
+   * 其餘文字節點清空；完全不動 element 結構。
+   *
+   * 為什麼不用 `el.textContent = translation`：後者會清掉所有子節點（包含 inner
+   * wrapper 例如 <div>/<span>），只留一個裸文字節點 child。在一般網頁沒差，但
+   * MJML / Mailjet / Mailchimp 等 HTML email 模板常把外層 `<td>` 設為
+   * `font-size: 0`（消除 inline-block 欄位間的空白縫隙），真正字體大小放在內層
+   * `<div>` 或 `<span>` 上。內層 wrapper 一旦被清掉，文字繼承 TD 的 `font-size: 0px`
+   * → 視覺上「整段消失」。歷史教訓：v0.48 之前 Gmail 打開 MJML newsletter（例如
+   * Claude 官方歡迎信）翻完之後標題 / 段落 / step 卡片文字全部不見，icon 卻留著。
+   *
+   * 對純文字元素（只有一個 text child）行為等價於舊版 `el.textContent = translation`,
+   * 因此沒有回歸風險。對含媒體元素（圖片 / SVG / video）則同時達成「保留媒體 + 替換
+   * 最長文字節點」目標，取代原本的 containsMedia() 分支邏輯。
+   *
+   * 需過濾的技術節點（歷史教訓 v0.33 / v0.34）:
+   *   (1) <script>/<style>/<noscript>/<code>/<pre> 底下的文字節點
+   *   (2) CSS display:none / visibility:hidden 的隱形祖先底下的文字節點
+   * Wikipedia 的 #coordinates 同時含 .geo-dms（可見）與 .geo-nondefault > .geo-dec
+   * （display:none），過濾掉隱形祖先才能確保譯文塞進看得到的節點。
+   */
+  function collectVisibleTextNodes(el) {
+    const textNodes = [];
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        let p = node.parentElement;
+        while (p && p !== el) {
+          if (HARD_EXCLUDE_TAGS.has(p.tagName)) return NodeFilter.FILTER_REJECT;
+          const cs = p.ownerDocument?.defaultView?.getComputedStyle?.(p);
+          if (cs && (cs.display === 'none' || cs.visibility === 'hidden')) {
+            return NodeFilter.FILTER_REJECT;
+          }
+          p = p.parentElement;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    let n;
+    while ((n = walker.nextNode())) {
+      if (n.nodeValue && n.nodeValue.trim()) textNodes.push(n);
+    }
+    return textNodes;
+  }
+
+  function findLongestTextNode(textNodes) {
+    let main = textNodes[0];
+    for (const t of textNodes) {
+      if (t.nodeValue.length > main.nodeValue.length) main = t;
+    }
+    return main;
+  }
+
+  /**
+   * v0.52: deserializer 失敗 fallback 用的「丟掉所有 inner DOM,以乾淨純文字
+   * 塞回去」助手。
+   *
+   * 為什麼不直接 `el.textContent = cleaned`：
+   * MJML / Mailjet email 模板常見「外層 TD 設 font-size:0,真字體放在內層
+   * DIV / SPAN」的 inline-block-gap 消除技巧。直接寫 el.textContent 會把
+   * 內層 wrapper 一併清掉,文字繼承 TD 的 0px → 整段消失。
+   *
+   * 為什麼不沿用 replaceTextInPlace:
+   * 它把譯文塞進「最長文字節點」,對於 Wikipedia ambox 來說最長文字節點剛好
+   * 在 <I><SMALL><A> 裡面,Chinese 譯文會繼承 italic + small + link 樣式,
+   * 看起來像視覺災難(雖然結構不再是 nested 巢狀錯亂)。
+   *
+   * 折中策略:
+   *   1. 預設直接 `el.textContent = cleaned` —— 一般網頁(含 ambox)就不會
+   *      帶任何 inline ancestor 樣式。
+   *   2. 偵測「el 自己 computed font-size 趨近 0」這個 MJML 特徵；命中時
+   *      改去找第一個 font-size 正常的後代當寫入目標,保留 inner wrapper。
+   */
+  function plainTextFallback(el, cleaned) {
+    const cs = el.ownerDocument?.defaultView?.getComputedStyle?.(el);
+    const px = cs ? parseFloat(cs.fontSize) : NaN;
+    if (Number.isFinite(px) && px < 1) {
+      // MJML font-size:0 outer wrapper 模式：找第一個 font-size 正常的後代
+      const all = el.querySelectorAll('*');
+      for (const d of all) {
+        const dcs = d.ownerDocument?.defaultView?.getComputedStyle?.(d);
+        const dpx = dcs ? parseFloat(dcs.fontSize) : NaN;
+        if (Number.isFinite(dpx) && dpx >= 1) {
+          d.textContent = cleaned;
+          return;
+        }
+      }
+      // 找不到合適的後代 → 還是寫到 el(至少不會 silent 失敗)
+    }
+    el.textContent = cleaned;
+  }
+
+  function replaceTextInPlace(el, translation) {
+    // v0.50: 譯文若含 \n（來自序列化時把 <br> 轉成的段落分隔）,改走
+    // fragment 路徑塞回真正的 <br>,否則只是把字面 \n 塞進 text node 會被
+    // HTML 渲染成空白,失去段落視覺效果。
+    if (translation && translation.includes('\n')) {
+      const frag = buildFragmentFromTextWithBr(translation);
+      replaceNodeInPlace(el, frag);
+      return;
+    }
+    const textNodes = collectVisibleTextNodes(el);
+    if (textNodes.length === 0) {
+      // 沒有獨立文字節點（例如 element 裡只有媒體 + 空白）→ 附加在最後
+      el.appendChild(document.createTextNode(translation));
+      return;
+    }
+    // 把整段譯文塞給最長的那個文字節點（主承載點），其餘清空
+    const main = findLongestTextNode(textNodes);
+    main.nodeValue = translation;
+    for (const t of textNodes) {
+      if (t !== main) t.nodeValue = '';
+    }
+  }
+
+  /**
+   * v0.50: 把含 \n 的純文字譯文做成 DocumentFragment,\n 換成真正的 <br>。
+   * 用在無 slots 路徑（路徑 B）的譯文有段落分隔時。
+   */
+  function buildFragmentFromTextWithBr(text) {
+    const frag = document.createDocumentFragment();
+    const parts = text.split('\n');
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i]) frag.appendChild(document.createTextNode(parts[i]));
+      if (i < parts.length - 1) frag.appendChild(document.createElement('br'));
+    }
+    return frag;
+  }
+
+  /**
+   * v0.49: 跟 replaceTextInPlace 同樣思路,但塞的是 DocumentFragment 而非純文字。
+   * 用在 slots 路徑 A——fragment 內已經有樣式 inline 元素（SPAN/A/STRONG 之類）,
+   * 但我們仍必須保留 el 下的 MJML inner wrapper（DIV/SPAN）來提供真字體大小,
+   * 所以「就地替換最長文字節點」而不是 `el.textContent = ''; el.appendChild(frag)`。
+   *
+   * 作法：找到 el 下最長的可見文字節點,把 fragment 插在它的 parent 的原位置,
+   * 然後把它跟其他文字節點一併清掉。fragment 落在 MJML inner wrapper 底下,
+   * 自動繼承 wrapper 的 font-size。
+   */
+  function replaceNodeInPlace(el, frag) {
+    // v0.54: 兩條互斥路徑——
+    //
+    // (A) 一般網頁(預設):直接清掉 el 所有 children,把 fragment append 進去。
+    //     fragment 本身已經由 deserializeWithPlaceholders 從 slots 重建出
+    //     完整結構(含原本所有 inline 元素 / 媒體 atomic placeholder),所以
+    //     全部覆蓋是安全的。
+    //
+    // (B) MJML / Mailjet email 模板:外層 el 自己 computed font-size 趨近 0
+    //     (font-size:0 inline-block-gap 消除技巧),真字體放在內層 wrapper。
+    //     若走 (A) 把 inner wrapper 一起清掉,文字繼承 0px → 整段消失。
+    //     這條路徑用「最長文字節點就地替換」的舊行為,讓 fragment 落在
+    //     wrapper 底下繼承正確 font-size。
+    //
+    // 為什麼要分流(歷史教訓):
+    // v0.49 → v0.53 預設都走 (B),結果 Wikipedia ambox 這種 el 內含
+    // <I><SMALL><A> 巢狀結構時,「最長文字節點」剛好在最深的 <A> 裡面,
+    // fragment 被插在那裡 → 譯文整段繼承 italic + small + link 樣式,
+    // 而 el 上原本的 <B> / 其他 inline 元素又沒被清,殘留成空殼,看起來
+    // 像「巢狀錯亂 + 全段斜體粗體」的災難。
+    //
+    // 修正方向:預設值改為「整個替換」,只在 MJML font-size:0 的特殊狀況
+    // 才退回 inner-wrapper 保留路徑。
+    let fragHasBr = false;
+    const fw = document.createTreeWalker(frag, NodeFilter.SHOW_ELEMENT);
+    let fn;
+    while ((fn = fw.nextNode())) {
+      if (fn.tagName === 'BR') { fragHasBr = true; break; }
+    }
+
+    const cs = el.ownerDocument?.defaultView?.getComputedStyle?.(el);
+    const px = cs ? parseFloat(cs.fontSize) : NaN;
+    const isMjmlZero = Number.isFinite(px) && px < 1;
+
+    if (!isMjmlZero) {
+      // 路徑 (A):整段覆蓋。
+      while (el.firstChild) el.removeChild(el.firstChild);
+      el.appendChild(frag);
+      return;
+    }
+
+    // 路徑 (B):MJML font-size:0 → 保留 inner wrapper,只就地替換最長文字節點。
+    if (fragHasBr) {
+      const oldBrs = el.querySelectorAll('br');
+      for (const br of oldBrs) {
+        if (br.parentNode) br.parentNode.removeChild(br);
+      }
+    }
+
+    const textNodes = collectVisibleTextNodes(el);
+    if (textNodes.length === 0) {
+      el.appendChild(frag);
+      return;
+    }
+    const main = findLongestTextNode(textNodes);
+    for (const t of textNodes) {
+      if (t !== main) t.nodeValue = '';
+    }
+    const parent = main.parentNode;
+    if (parent) {
+      parent.insertBefore(frag, main);
+      parent.removeChild(main);
+    } else {
+      el.appendChild(frag);
+    }
   }
 
   /**
