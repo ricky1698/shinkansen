@@ -163,11 +163,14 @@ export async function extractGlossary(compressedText, settings) {
       topP,
       topK,
       maxOutputTokens: glossaryMaxOutput,
-      // v0.72: 完全移除 responseMimeType: 'application/json'。
-      // 即使不帶 responseSchema，JSON mode 在某些模型版本下仍然會
-      // 提早結束生成（實測 maxOutputTokens=8192 卻只產出 316 tokens，
-      // finishReason=MAX_TOKENS）。改為純文字輸出，由 prompt 要求 JSON
-      // 格式，我們自己從回應中解析。
+      // v0.74: 關閉思考功能。gemini-2.5-flash 是 thinking model，思考 token
+      // 計入 maxOutputTokens 額度。術語擷取是直覺性對照工作，不需深度推理，
+      // 關閉思考後全部 token 額度留給實際 JSON 輸出，徹底解決「明明上限 8192
+      // 卻只產出 300 多 tokens 就 MAX_TOKENS」的問題（根因：思考 token 吃掉
+      // 了 7000+ 額度）。v0.72 的註解（「JSON mode 提早結束生成」）描述的也是
+      // 同一個現象，當時誤判為 JSON mode 的問題而移除 responseMimeType，
+      // 實際上是 thinking token 的問題。
+      thinkingConfig: { thinkingBudget: 0 },
     },
     safetySettings: [
       { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
@@ -308,14 +311,14 @@ export async function extractGlossary(compressedText, settings) {
  * 本地快取命中的段落根本不會送 API，而 implicit cache 命中的段落有送 API
  * 但前綴（system prompt 那一大段）被 Gemini 內部 cache 省下。
  */
-export async function translateBatch(texts, settings, referencePairs) {
+export async function translateBatch(texts, settings, glossary) {
   if (!texts?.length) return { translations: [], usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 } };
   const out = new Array(texts.length);
   const usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
   const chunks = packChunks(texts);
   for (const { start, end } of chunks) {
     const slice = texts.slice(start, end);
-    const { parts, usage: u } = await translateChunk(slice, settings, referencePairs);
+    const { parts, usage: u } = await translateChunk(slice, settings, glossary);
     for (let j = 0; j < parts.length; j++) out[start + j] = parts[j];
     usage.inputTokens += u.inputTokens;
     usage.outputTokens += u.outputTokens;
@@ -324,7 +327,7 @@ export async function translateBatch(texts, settings, referencePairs) {
   return { translations: out, usage };
 }
 
-async function translateChunk(texts, settings, referencePairs) {
+async function translateChunk(texts, settings, glossary) {
   if (!texts?.length) return [];
   const { apiKey, geminiConfig } = settings;
   const {
@@ -362,21 +365,12 @@ async function translateChunk(texts, settings, referencePairs) {
     effectiveSystem = effectiveSystem + '\n\n額外規則（極重要，處理佔位符標記）:\n輸入中可能含有兩種佔位符標記，都是用來保留原文結構，必須原樣保留、不可翻譯、不可省略、不可改寫、不可新增、不可重排。佔位符裡的數字、斜線、星號 **必須是半形 ASCII 字元**（0-9、/、*），絕對不可改成全形（０-９、／、＊），否則程式無法配對會整段崩壞。\n\n（A）配對型 ⟦數字⟧…⟦/數字⟧（例如 ⟦0⟧Tokugawa Ieyasu⟦/0⟧)：\n- 把標記視為透明外殼。外殼「內部」的文字跟外殼「外部」的文字一樣，全部都要翻譯成繁體中文。\n- ⟦數字⟧ 與 ⟦/數字⟧ 兩個標記本身原樣保留，數字不變。\n- **配對型可以巢狀嵌套**（例如 ⟦0⟧may incorporate text from a ⟦1⟧large language model⟦/1⟧, which is ...⟦/0⟧）。巢狀代表原文是 `<b>text <a>link</a> more text</b>` 這類嵌套結構。翻譯時必須**同時**保留外層與內層兩組標記、不可扁平化成單層、不可交換順序、不可遺漏任何一層。外層與內層的內部文字全部要翻成繁體中文。\n\n（B）自閉合 ⟦*數字⟧（例如 ⟦*5⟧)：\n- 這是「原子保留」位置記號，代表原文裡有一段不可翻譯的小區塊（例如維基百科腳註參照 [2])。\n- 整個 ⟦*數字⟧ token 原樣保留，不可拆開、不可翻譯、不可省略，數字不變。\n- 它的位置代表那段內容應該插在譯文的哪裡。\n\n具體範例 1（單層）：\n輸入： ⟦0⟧Tokugawa Ieyasu⟦/0⟧ won the ⟦1⟧Battle of Sekigahara⟦/1⟧ in 1600.⟦*2⟧\n正確輸出： ⟦0⟧德川家康⟦/0⟧於 1600 年贏得⟦1⟧關原之戰⟦/1⟧。⟦*2⟧\n錯誤輸出 1： ⟦0⟧Tokugawa Ieyasu⟦/0⟧於 1600 年贏得⟦1⟧Battle of Sekigahara⟦/1⟧。⟦*2⟧（配對型內部英文沒翻）\n錯誤輸出 2： ⟦0⟧德川家康⟦/0⟧於 1600 年贏得⟦1⟧關原之戰⟦/1⟧。[2]（自閉合 ⟦*2⟧ 被擅自還原成 [2])\n\n具體範例 2（巢狀）：\n輸入： This article ⟦0⟧may incorporate text from a ⟦1⟧large language model⟦/1⟧, which is ⟦2⟧prohibited in Wikipedia articles⟦/2⟧⟦/0⟧.\n正確輸出： 本條目⟦0⟧可能包含來自⟦1⟧大型語言模型⟦/1⟧的文字，這在⟦2⟧維基百科條目中是被禁止的⟦/2⟧⟦/0⟧。\n錯誤輸出 3： 本條目可能包含來自⟦1⟧大型語言模型⟦/1⟧的文字，這在⟦2⟧維基百科條目中是被禁止的⟦/2⟧。（外層 ⟦0⟧…⟦/0⟧ 被扁平化丟掉）';
   }
 
-  // v0.73（方案 3）：首批翻譯參考對放在 systemInstruction 最末端。
-  // 這是「前段翻譯範例」而非「行為規則」，放最後不會干擾佔位符 / 換行等關鍵規則。
-  // LLM 會從範例中自行學習術語一致性，不需要明確列出術語對照表。
-  if (referencePairs && referencePairs.length > 0) {
-    // 控制 token 成本：最多取前 20 對，每對截斷到 200 字元
-    const maxPairs = 20;
-    const maxLen = 200;
-    const pairs = referencePairs.slice(0, maxPairs);
-    const lines = pairs.map(p => {
-      const src = p.source.length > maxLen ? p.source.slice(0, maxLen) + '…' : p.source;
-      const tgt = p.target.length > maxLen ? p.target.slice(0, maxLen) + '…' : p.target;
-      return `原文：${src}\n譯文：${tgt}`;
-    }).join('\n---\n');
+  // v0.69/v0.71: 術語對照表放在 systemInstruction 最末端。
+  // 這是「參考資料」而非「行為規則」，放最後不會干擾佔位符 / 換行等關鍵規則。
+  if (glossary && glossary.length > 0) {
+    const lines = glossary.map(e => `${e.source} → ${e.target}`).join('\n');
     effectiveSystem = effectiveSystem +
-      '\n\n以下是本篇文章前段的翻譯範例，請保持術語、人名、地名、專有名詞的譯法一致：\n' + lines;
+      '\n\n以下是本篇文章的術語對照表，遇到這些原文一律使用指定譯名，不可自行改寫：\n' + lines;
   }
 
   const body = {
