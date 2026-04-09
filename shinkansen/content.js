@@ -8,6 +8,8 @@
 
   const STATE = {
     translated: false,
+    translating: false,      // v0.80: 翻譯進行中（防止重複觸發 + 支援中途取消）
+    abortController: null,   // v0.80: AbortController，翻譯中按 Alt+S 或離開頁面時 abort
     cache: new Map(),       // 段落文字 → 譯文
     // 記錄每個被替換過的元素與它原本的 innerHTML，供還原使用。
     // v0.36 起改為 Map，key 是 element，value 是 originalHTML。這樣同一個
@@ -1157,6 +1159,9 @@
   const MAX_UNITS_PER_BATCH = 20;        // 段數上限（原 CHUNK_SIZE）
   const MAX_CHARS_PER_BATCH = 3500;      // 字元預算，作為 token proxy（≈ 1000 英文 tokens，留 output headroom）
   const DEFAULT_MAX_CONCURRENT = 10; // content.js 側並發上限（與 background 的 rate limiter 雙重保險）
+  // v0.81: 單頁翻譯段落總數上限。超大頁面（如維基百科年表條目）可能收集到
+  // 500+ 段，全部送 API 會造成不必要的成本與延遲。超過此上限時截斷並提示使用者。
+  const MAX_TOTAL_UNITS = 500;
 
   // ─── v0.69: 術語表一致化 ──────────────────────────────
   // 門檻常數（與 storage.js 的 glossary 設定對應，但 content.js 不 import ES module，
@@ -1266,7 +1271,7 @@
    * onProgress: 可選 callback(done, total),每批完成時呼叫一次
    * glossary: v0.69 可選的術語對照表,帶入則每批翻譯都會附上
    */
-  async function translateUnits(units, { onProgress, glossary } = {}) {
+  async function translateUnits(units, { onProgress, glossary, signal } = {}) {
     const total = units.length;
     // 對每個段落都先序列化成「文字 + slots」,文字內含 ⟦N⟧…⟦/N⟧ 佔位符。
     // 沒有可保留 inline 元素的段落 slots 為空陣列,行為等同舊版純文字翻譯。
@@ -1312,6 +1317,8 @@
     console.log(`[Shinkansen] translateUnits: ${jobs.length} batches, ${total} units, maxConcurrent=${maxConcurrent}`);
 
     await runWithConcurrency(jobs, maxConcurrent, async (job) => {
+      // v0.80: 若翻譯已被取消，跳過剩餘批次
+      if (signal?.aborted) return;
       const batchIdx = jobs.indexOf(job);
       const t0 = Date.now();
       console.log(`[Shinkansen] batch ${batchIdx + 1}/${jobs.length} start: ${job.texts.length} units, ${job.chars} chars`);
@@ -1356,6 +1363,21 @@
       return;
     }
 
+    // v0.80: 翻譯進行中 → 使用者再按一次 = 取消翻譯
+    if (STATE.translating) {
+      console.log('[Shinkansen] aborting in-progress translation');
+      STATE.abortController?.abort();
+      showToast('loading', '正在取消翻譯⋯');
+      return;
+    }
+
+    // v0.80: 離線偵測 — 在發任何 API 呼叫前先檢查網路狀態，
+    // 避免離線時走完 3 次重試迴圈才顯示錯誤（每次重試有指數退避等待）。
+    if (!navigator.onLine) {
+      showToast('error', '目前處於離線狀態，無法翻譯。請確認網路連線後再試', { autoHideMs: 5000 });
+      return;
+    }
+
     // v0.76: 頁面層級語言偵測 — 若整頁文字以繁體中文為主，直接跳過。
     // 這避免了繁中頁面上少數英文腳註/引用被單獨送去翻譯的問題。
     // 取 document.body.innerText 的前 2000 字做樣本（足以判斷主要語言，
@@ -1366,10 +1388,25 @@
       return;
     }
 
-    const units = collectParagraphs();
+    // v0.80: 設定翻譯進行中旗標與 AbortController
+    STATE.translating = true;
+    STATE.abortController = new AbortController();
+    const abortSignal = STATE.abortController.signal;
+
+    let units = collectParagraphs();
     if (units.length === 0) {
       showToast('error', '找不到可翻譯的內容', { autoHideMs: 3000 });
+      STATE.translating = false;
+      STATE.abortController = null;
       return;
+    }
+
+    // v0.81: 超大頁面防護 — 段落數超過上限時截斷，避免 API 成本爆炸
+    let truncatedCount = 0;
+    if (units.length > MAX_TOTAL_UNITS) {
+      truncatedCount = units.length - MAX_TOTAL_UNITS;
+      console.warn(`[Shinkansen] page has ${units.length} units, truncating to ${MAX_TOTAL_UNITS} (skipping last ${truncatedCount})`);
+      units = units.slice(0, MAX_TOTAL_UNITS);
     }
     const total = units.length;
 
@@ -1489,10 +1526,27 @@
 
       const { done, failures, pageUsage } = await translateUnits(units, {
         glossary,
+        signal: abortSignal,
         onProgress: (d, t) => showToast('loading', `翻譯中… ${d} / ${t}`, {
           progress: d / t,
         }),
       });
+
+      // v0.80: 若翻譯被中途取消，還原已注入的部分譯文並清理
+      if (abortSignal.aborted) {
+        console.log(`[Shinkansen] translation aborted: ${done}/${total} done before cancel`);
+        if (STATE.originalHTML.size > 0) {
+          // 還原已注入的部分譯文
+          STATE.originalHTML.forEach((originalHTML, el) => {
+            el.innerHTML = originalHTML;
+            el.removeAttribute('data-shinkansen-translated');
+          });
+          STATE.originalHTML.clear();
+        }
+        STATE.translated = false;
+        showToast('success', '已取消翻譯', { progress: 1, stopTimer: true, autoHideMs: 2000 });
+        return; // finally 會清理 translating 旗標
+      }
 
       // 有部分失敗 → 顯示部分完成的訊息,但仍標記為已翻譯
       if (failures.length) {
@@ -1509,7 +1563,9 @@
 
       if (!failures.length) {
         const totalTokens = pageUsage.inputTokens + pageUsage.outputTokens;
-        const successMsg = `翻譯完成 （${total} 段）`;
+        const successMsg = truncatedCount > 0
+          ? `翻譯完成 （${total} 段，另有 ${truncatedCount} 段因頁面過長被略過）`
+          : `翻譯完成 （${total} 段）`;
         let detail;
         if (totalTokens > 0) {
           // v0.48: Toast 顯示「實付」值（已套 Gemini implicit cache 折扣）。
@@ -1566,7 +1622,14 @@
       scheduleRescanForLateContent();
     } catch (err) {
       console.error('[Shinkansen]', err);
-      showToast('error', `翻譯失敗:${err.message}`, { stopTimer: true });
+      // v0.80: 若是 abort 觸發的錯誤，不顯示「翻譯失敗」
+      if (!abortSignal.aborted) {
+        showToast('error', `翻譯失敗:${err.message}`, { stopTimer: true });
+      }
+    } finally {
+      // v0.80: 無論成功、失敗或取消，都要清理翻譯中旗標
+      STATE.translating = false;
+      STATE.abortController = null;
     }
   }
 
@@ -1657,6 +1720,8 @@
       workers.push((async () => {
         // eslint-disable-next-line no-constant-condition
         while (true) {
+          // v0.80: 若 STATE.abortController 已 abort，不再取新 job
+          if (STATE.abortController?.signal.aborted) return;
           const idx = cursor++;
           if (idx >= jobs.length) return;
           await workerFn(jobs[idx]);
@@ -2039,6 +2104,16 @@
     chrome.runtime.sendMessage({ type: 'CLEAR_BADGE' }).catch(() => {});
     showToast('success', '已還原原文', { progress: 1, autoHideMs: 2000 });
   }
+
+  // ─── v0.80: 頁面離開時取消進行中的翻譯 ────────────────
+  // 避免使用者跳走後 background 還在跑 API 呼叫浪費 token。
+  // 注意：beforeunload 裡不能做 async 操作，只能同步設 abort flag，
+  // 讓 runWithConcurrency 的 worker 在下次 iteration 自行停止。
+  window.addEventListener('beforeunload', () => {
+    if (STATE.translating && STATE.abortController) {
+      STATE.abortController.abort();
+    }
+  });
 
   // ─── 訊息接收 （來自 background / popup) ──────────────
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
