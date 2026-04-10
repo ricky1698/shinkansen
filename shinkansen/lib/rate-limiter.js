@@ -1,4 +1,4 @@
-// rate-limiter.js — 三維度 sliding window rate limiter + priority queue
+// rate-limiter.js — 三維度 sliding window rate limiter
 //
 // 對應 Gemini API 的三維度限制：
 //   RPM: 每分鐘請求數       (sliding 60 秒視窗)
@@ -10,16 +10,13 @@
 //   await limiter.acquire(estInputTokens);
 //   // ... 做實際的 API 請求
 //
-// 特性:
-// - acquire() 是 async,若任何維度超限會自動 setTimeout 等待到最近的釋放點後遞迴重試
-// - 內部維護兩個 sliding window 環形緩衝區（requests 與 tokens)
-// - priority queue: p0 優先於 p1（為未來術語表請求保留的插隊機制,v0.35 MVP 未使用）
-// - RPD 計數透過 chrome.storage.local 持久化,service worker 被回收也不丟
-// - 安全邊際（safetyMargin)：每個上限實際只用 (1 - margin) 比例,避免踩邊觸發 429
-//
-// 注意：service worker 重啟後,RPM/TPM 的 sliding window 視同清空
-//（這是可接受的漂移,因為 Gemini 自己也是 rolling window、容錯度高）,
-// 但 RPD 會從 storage 讀回,避免使用者配額累計錯亂。
+// v0.89 重構：移除 priority queue + dispatchLoop 架構。
+// 原因：dispatchLoop 透過 Promise.resolve().then() 或 setTimeout(0) 排程，
+// 在 Chrome Service Worker 環境中會被吞掉不執行（推測 SW idle 排程問題），
+// 導致所有翻譯請求卡在 acquire 永遠不 resolve。
+// 新架構：每個 acquire 自己 inline 等待 + 記錄用量，不依賴外部 dispatcher。
+// 代價：失去 p0/p1 priority 排序（術語表不再優先於翻譯請求），
+// 但實際影響很小——術語表請求在翻譯開始前就發出，不會跟翻譯請求搶 slot。
 
 import { debugLog } from './logger.js';
 
@@ -28,7 +25,6 @@ const RPD_KEY_PREFIX = 'rateLimit_rpd_';
 
 /** 取得太平洋時間的 YYYYMMDD 字串,用於 RPD key。 */
 function getPacificDateKey(now = new Date()) {
-  // Intl 方式比手動計算時差更可靠（自動處理 DST)
   const fmt = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'America/Los_Angeles',
     year: 'numeric',
@@ -51,14 +47,6 @@ export class RateLimiter {
     this.rpdCount = 0;
     this.rpdLoaded = false;
     this.rpdLoadingPromise = null;
-
-    // Priority queue(p0 優先 / p1 一般)
-    // 每個 entry: { estTokens, resolve, reject }
-    this.p0 = [];
-    this.p1 = [];
-
-    // 是否有 dispatcher 正在跑
-    this.dispatching = false;
   }
 
   updateLimits({ rpm, tpm, rpd, safetyMargin = 0.1 }) {
@@ -128,57 +116,51 @@ export class RateLimiter {
   }
 
   /**
-   * 等待並取得一個 slot。若任何維度超限則等待到最近的釋放時間點再試。
+   * 等待並取得一個 slot。若任何維度超限則 sleep 到最近的釋放時間點再重試。
    * @param {number} estTokens 本次請求估計 input token 數
-   * @param {number} priority 0 = 高(術語表)/ 1 = 一般翻譯
+   * @param {number} priority 保留參數，目前不使用（向下相容）
    * @returns {Promise<void>}
    */
   async acquire(estTokens, priority = 1) {
     await this.loadRpdIfNeeded();
-    return new Promise((resolve, reject) => {
-      const entry = { estTokens, resolve, reject };
-      if (priority === 0) this.p0.push(entry);
-      else this.p1.push(entry);
-      this.scheduleDispatch();
-    });
-  }
 
-  scheduleDispatch() {
-    if (this.dispatching) return;
-    this.dispatching = true;
-    // 用 microtask 啟動,避免 recursive stack
-    Promise.resolve().then(() => this.dispatchLoop());
-  }
+    // Inline 等待：自己 loop 直到 RPM/TPM 有 slot
+    // 注意：RPD 不在此強制等待——RPD 只是軟性預算警告，
+    // 真正的每日限額由 Gemini API 自己回傳 429 錯誤。
+    let attempts = 0;
+    while (true) {
+      const waitMs = this.computeWaitMs(estTokens);
+      if (waitMs <= 0) break;
 
-  async dispatchLoop() {
-    try {
-      while (this.p0.length || this.p1.length) {
-        const entry = this.p0.length ? this.p0[0] : this.p1[0];
-        const fromP0 = this.p0.length > 0;
-        const waitMs = this.computeWaitMs(entry.estTokens);
-
-        if (waitMs > 0) {
-          await this.sleep(waitMs);
-          continue; // 重跑 loop 重新檢查（因為期間可能跨日或狀態改變）
-        }
-
-        // 可以放行了
-        if (fromP0) this.p0.shift();
-        else this.p1.shift();
-
-        const now = Date.now();
-        this.requests.push(now);
-        this.tokens.push({ t: now, n: entry.estTokens });
-        this.rpdCount += 1;
-        // Persist RPD 寫入不等待完成（小量資料,容忍短暫不一致）
-        this.persistRpd().catch(err =>
-          debugLog('warn', 'rpd persist failed', { error: err.message })
-        );
-        entry.resolve();
+      attempts++;
+      if (attempts === 1) {
+        debugLog('info', 'rate-limit', 'acquire waiting', {
+          waitMs, estTokens,
+          rpmUsed: this.requests.length, rpmCap: this.rpmCap,
+          rpdUsed: this.rpdCount, rpdCap: this.rpdCap,
+        });
       }
-    } finally {
-      this.dispatching = false;
+      await this.sleep(waitMs);
     }
+
+    // 記錄用量
+    const now = Date.now();
+    this.requests.push(now);
+    this.tokens.push({ t: now, n: estTokens });
+    this.rpdCount += 1;
+    // Persist RPD 寫入不等待完成（小量資料,容忍短暫不一致）
+    this.persistRpd().catch(err =>
+      debugLog('warn', 'rate-limit', 'rpd persist failed', { error: err.message })
+    );
+
+    // RPD 超過預算上限 → 回傳警告旗標（不阻擋翻譯）
+    const rpdExceeded = this.rpdCount > this.rpdCap;
+    if (rpdExceeded) {
+      debugLog('warn', 'rate-limit', 'RPD budget exceeded', {
+        rpdUsed: this.rpdCount, rpdCap: this.rpdCap,
+      });
+    }
+    return { rpdExceeded };
   }
 
   /**
@@ -189,28 +171,20 @@ export class RateLimiter {
     const now = Date.now();
     this.pruneWindow(now);
 
-    // RPD 檢查（此維度不是時間視窗,爆了就是明天才能繼續,不 wait)
-    if (this.rpdCount + 1 > this.rpdCap) {
-      // 特殊回傳：代表 RPD 爆了,上層呼叫應把隊伍都 reject。
-      // 但為了實作簡單,這裡讓它等到太平洋午夜再 retry。
-      // v0.35 MVP：直接丟到一個很大的 wait（24 小時）避免 busy-loop,
-      // 實務上使用者會看到 toast 卡住,自己取消。未來可改成更友善處理。
-      return 24 * 60 * 60 * 1000;
-    }
+    // RPD 不在此強制等待——RPD 只是軟性預算警告，見 acquire() 說明。
 
     let wait = 0;
 
-    // RPM 檢查：若當前請求數 + 1 > cap,需等到最早的時間戳滑出視窗
+    // RPM 檢查
     if (this.requests.length + 1 > this.rpmCap) {
       const earliest = this.requests[this.requests.length - this.rpmCap];
       const releaseAt = earliest + WINDOW_MS;
       wait = Math.max(wait, releaseAt - now + 5);
     }
 
-    // TPM 檢查：若 (當前 token + 新 estTokens) > cap,需等到足夠的 token 滑出
+    // TPM 檢查
     const currentTok = this.currentTokenSum();
     if (currentTok + estTokens > this.tpmCap) {
-      // 從最舊的 token 開始累計,找出需要滑掉多少才夠容納 estTokens
       const needToRelease = currentTok + estTokens - this.tpmCap;
       let released = 0;
       for (const e of this.tokens) {
@@ -221,7 +195,6 @@ export class RateLimiter {
           break;
         }
       }
-      // 理論上不會跑完迴圈,但保險：若單一請求的 estTokens 就大於 tpmCap,等一個完整視窗
       if (released < needToRelease) {
         wait = Math.max(wait, WINDOW_MS + 5);
       }
@@ -247,7 +220,6 @@ export class RateLimiter {
       rpdCap: this.rpdCap,
       rpdDateKey: this.rpdDateKey,
       safetyMargin: this.safetyMargin,
-      queued: this.p0.length + this.p1.length,
     };
   }
 }

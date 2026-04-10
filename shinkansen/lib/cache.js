@@ -6,6 +6,8 @@
 // 寫入時若 chrome.storage.local 配額滿，依時間戳排序刪除最舊的條目騰出空間。
 // 讀取時向下相容舊格式（純字串）。
 
+import { debugLog } from './logger.js';
+
 const KEY_PREFIX = 'tc_';
 const GLOSSARY_PREFIX = 'gloss_';   // v0.69: 術語表快取
 const VERSION_KEY = '__cacheVersion';
@@ -91,7 +93,7 @@ async function evictOldest(targetBytes) {
 
   if (toRemove.length > 0) {
     await chrome.storage.local.remove(toRemove);
-    console.log(`[Shinkansen] cache LRU eviction: removed ${toRemove.length} entries, freed ~${(freed / 1024).toFixed(1)}KB`);
+    debugLog('info', 'cache', 'LRU eviction', { removed: toRemove.length, freedKB: +(freed / 1024).toFixed(1) });
   }
   return { removed: toRemove.length, freedBytes: freed };
 }
@@ -121,18 +123,18 @@ async function safeStorageSet(updates) {
     const msg = err?.message || '';
     // chrome.storage 配額滿的錯誤訊息包含 "QUOTA_BYTES" 或 "quota"
     if (msg.includes('QUOTA_BYTES') || msg.toLowerCase().includes('quota')) {
-      console.warn('[Shinkansen] storage quota exceeded, triggering LRU eviction');
+      debugLog('warn', 'cache', 'storage quota exceeded, triggering LRU eviction');
       await evictOldest(EVICTION_TARGET_BYTES);
       // 重試一次
       try {
         await chrome.storage.local.set(updates);
       } catch (retryErr) {
         // 淘汰後仍然寫不進去（可能單筆就超過上限）→ 靜默放棄，不 crash
-        console.error('[Shinkansen] storage write failed after eviction:', retryErr.message);
+        debugLog('error', 'cache', 'storage write failed after eviction', { error: retryErr.message });
       }
     } else {
       // 非配額問題 → 靜默放棄，不讓快取寫入問題中斷翻譯流程
-      console.error('[Shinkansen] storage write failed:', msg);
+      debugLog('error', 'cache', 'storage write failed', { error: msg });
     }
   }
 }
@@ -145,12 +147,12 @@ async function proactiveEvictionCheck() {
   try {
     const usage = await getCacheUsageBytes();
     if (usage > CACHE_QUOTA_BYTES * 0.9) {
-      console.log(`[Shinkansen] cache usage ${(usage / 1024 / 1024).toFixed(2)}MB > 90% threshold, proactive eviction`);
+      debugLog('info', 'cache', 'proactive eviction triggered', { usageMB: +(usage / 1024 / 1024).toFixed(2) });
       await evictOldest(EVICTION_TARGET_BYTES);
     }
   } catch (err) {
     // 檢查失敗不要影響正常流程
-    console.warn('[Shinkansen] proactive eviction check failed:', err.message);
+    debugLog('warn', 'cache', 'proactive eviction check failed', { error: err.message });
   }
 }
 

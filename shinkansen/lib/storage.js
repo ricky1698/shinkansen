@@ -1,8 +1,7 @@
 // storage.js — 設定讀寫封裝
 
 // v0.83: 預設 system prompt 全面升級——從「翻譯助理」提升為「首席翻譯專家」，
-// 強調台灣語感、排版規範、專有名詞保留策略。同步切換預設模型至 gemini-3-flash-preview
-// 並預設啟用 Thinking，搭配新 prompt 的深度要求。
+// 強調台灣語感、排版規範、專有名詞保留策略。同步切換預設模型至 gemini-3-flash-preview。
 const DEFAULT_SYSTEM_PROMPT = `<role_definition>
 你是一位精通英美流行文化與台灣在地文學的首席翻譯專家。你具備《華爾街日報》記者等級的敏銳度，以及散文作家的文字功底。你極度擅長將生硬的英文原句，打破原本的句法結構，轉譯為充滿張力、靈魂且完全符合台灣當代語感的出版級文字。
 </role_definition>
@@ -59,11 +58,10 @@ export const DEFAULT_SETTINGS = {
   geminiConfig: {
     model: 'gemini-3-flash-preview',       // v0.83: 預設模型升級至 Gemini 3 Flash
     serviceTier: 'DEFAULT',
-    temperature: 1.0,
+    temperature: 0.5,     // v0.94: 從 1.0 降為 0.5，降低 LLM 輸出不穩定風險（尤其是低效能模型）
     topP: 0.95,
     topK: 40,
     maxOutputTokens: 8192,
-    useThinking: true,     // v0.83: 預設啟用 Thinking，搭配新 prompt 的深度翻譯要求
     systemInstruction: DEFAULT_SYSTEM_PROMPT,
   },
   // 計價設定（USD per 1M tokens)。預設值為 gemini-3-flash-preview 的官方報價，
@@ -74,7 +72,7 @@ export const DEFAULT_SETTINGS = {
   },
   // v0.69: 全文術語表一致化設定
   glossary: {
-    enabled: true,
+    enabled: false,
     prompt: DEFAULT_GLOSSARY_PROMPT,
     temperature: 0.1,                  // 術語表要穩定，不要有創意
     skipThreshold: 1,                  // ≤ 此批次數完全不建術語表
@@ -84,7 +82,7 @@ export const DEFAULT_SETTINGS = {
   },
   targetLanguage: 'zh-TW',
   domainRules: { whitelist: [], blacklist: [] },
-  autoTranslate: true,
+  autoTranslate: false,
   debugLog: false,
   // v0.35 新增：並行翻譯 rate limiter 設定
   // tier 對應 Gemini API 付費層級(free / tier1 / tier2),決定 RPM/TPM/RPD 上限

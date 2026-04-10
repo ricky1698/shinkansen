@@ -6,7 +6,7 @@ import { debugLog } from './logger.js';
 
 const DELIMITER = '\n<<<SHINKANSEN_SEP>>>\n';
 // v0.37 起改為「段數 + 字元預算」雙門檻（雙重保險層 — content.js 已先打包過）
-const MAX_UNITS_PER_CHUNK = 20;
+const MAX_UNITS_PER_CHUNK = 12; // v0.91: 與 content.js 同步，從 20 降為 12
 const MAX_CHARS_PER_CHUNK = 3500;
 const MAX_BACKOFF_MS = 8000;
 
@@ -85,7 +85,7 @@ async function fetchWithRetry(url, body, { maxRetries = 3 } = {}) {
         body: JSON.stringify(body),
       });
     } catch (err) {
-      await debugLog('error', 'gemini fetch network error', { error: err.message, attempt });
+      await debugLog('error', 'api', 'gemini fetch network error', { error: err.message, attempt });
       if (attempt >= maxRetries) throw new Error('網路錯誤：' + err.message);
       await sleep(Math.min(MAX_BACKOFF_MS, 500 * Math.pow(2, attempt)));
       attempt += 1;
@@ -94,7 +94,7 @@ async function fetchWithRetry(url, body, { maxRetries = 3 } = {}) {
 
     // v0.84: 5xx 伺服器錯誤也重試（Gemini 偶爾回 500/503 服務暫時不可用）
     if (resp.status >= 500 && resp.status < 600) {
-      await debugLog('warn', `gemini ${resp.status} server error`, { status: resp.status, attempt });
+      await debugLog('warn', 'api', `gemini ${resp.status} server error`, { status: resp.status, attempt });
       if (attempt >= maxRetries) {
         let errMsg = `HTTP ${resp.status}`;
         try { const j = await resp.json(); errMsg = j?.error?.message || errMsg; } catch { /* noop */ }
@@ -114,7 +114,7 @@ async function fetchWithRetry(url, body, { maxRetries = 3 } = {}) {
     const retryAfterHeader = resp.headers.get('retry-after');
     const retryAfterSec = retryAfterHeader ? parseInt(retryAfterHeader, 10) : NaN;
 
-    await debugLog('warn', 'gemini 429 rate limit', {
+    await debugLog('warn', 'api', 'gemini 429 rate limit', {
       dimension: dim,
       retryAfter: retryAfterHeader,
       attempt,
@@ -176,13 +176,7 @@ export async function extractGlossary(compressedText, settings) {
       topP,
       topK,
       maxOutputTokens: glossaryMaxOutput,
-      // v0.74: 關閉思考功能。gemini-2.5-flash 是 thinking model，思考 token
-      // 計入 maxOutputTokens 額度。術語擷取是直覺性對照工作，不需深度推理，
-      // 關閉思考後全部 token 額度留給實際 JSON 輸出，徹底解決「明明上限 8192
-      // 卻只產出 300 多 tokens 就 MAX_TOKENS」的問題（根因：思考 token 吃掉
-      // 了 7000+ 額度）。v0.72 的註解（「JSON mode 提早結束生成」）描述的也是
-      // 同一個現象，當時誤判為 JSON mode 的問題而移除 responseMimeType，
-      // 實際上是 thinking token 的問題。
+      // v0.74: 關閉思考功能，避免思考 token 吃掉 maxOutputTokens 額度。
       thinkingConfig: { thinkingBudget: 0 },
     },
     safetySettings: [
@@ -199,7 +193,7 @@ export async function extractGlossary(compressedText, settings) {
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
-  await debugLog('info', 'glossary extraction request', { model, chars: compressedText.length, fetchTimeoutMs, maxOutputTokens: glossaryMaxOutput, settingsMaxOutput: maxOutputTokens });
+  await debugLog('info', 'glossary', 'glossary extraction request', { model, chars: compressedText.length, fetchTimeoutMs, maxOutputTokens: glossaryMaxOutput, settingsMaxOutput: maxOutputTokens });
 
   const t0 = Date.now();
 
@@ -218,7 +212,7 @@ export async function extractGlossary(compressedText, settings) {
   } catch (err) {
     clearTimeout(abortTimer);
     const reason = err.name === 'AbortError' ? `fetch timeout (${fetchTimeoutMs}ms)` : 'network error';
-    await debugLog('error', `glossary extraction failed (${reason})`, { error: err.message, ms: Date.now() - t0 });
+    await debugLog('error', 'glossary', `glossary extraction failed (${reason})`, { error: err.message, elapsed: Date.now() - t0 });
     return { glossary: [], usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 }, _diag: `${reason}: ${err.message}` };
   }
   clearTimeout(abortTimer);
@@ -227,7 +221,7 @@ export async function extractGlossary(compressedText, settings) {
   try {
     json = await resp.json();
   } catch (parseErr) {
-    await debugLog('error', 'glossary extraction: response body parse failed', { status: resp.status, error: parseErr.message });
+    await debugLog('error', 'glossary', 'glossary response body parse failed', { status: resp.status, error: parseErr.message });
     return { glossary: [], usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 }, _diag: `resp.json() failed: ${parseErr.message}` };
   }
   const ms = Date.now() - t0;
@@ -240,15 +234,15 @@ export async function extractGlossary(compressedText, settings) {
 
   if (!resp.ok) {
     const errMsg = json?.error?.message || `HTTP ${resp.status}`;
-    await debugLog('error', 'glossary extraction failed (API)', { status: resp.status, error: errMsg, ms });
+    await debugLog('error', 'glossary', 'glossary extraction failed (API)', { status: resp.status, error: errMsg, elapsed: ms });
     // v0.70: 回傳 _diag 供 content.js 顯示，方便從頁面 console 看到錯誤原因
     return { glossary: [], usage, _diag: `API error ${resp.status}: ${errMsg}` };
   }
 
   const rawText = json?.candidates?.[0]?.content?.parts?.[0]?.text || '';
   const finishReason = json?.candidates?.[0]?.finishReason || 'unknown';
-  await debugLog('info', 'glossary extraction response', {
-    ms, usage: meta, rawChars: rawText.length, finishReason,
+  await debugLog('info', 'glossary', 'glossary extraction response', {
+    elapsed: ms, usage: meta, rawChars: rawText.length, finishReason,
   });
 
   // v0.72: 不用 responseMimeType 後，模型可能在 JSON 前後附帶說明文字
@@ -272,7 +266,7 @@ export async function extractGlossary(compressedText, settings) {
   try {
     parsed = JSON.parse(jsonStr);
   } catch (parseErr) {
-    await debugLog('warn', 'glossary JSON parse failed', {
+    await debugLog('warn', 'glossary', 'glossary JSON parse failed', {
       error: parseErr.message, finishReason,
       preview: rawText.slice(0, 500),
     });
@@ -290,7 +284,7 @@ export async function extractGlossary(compressedText, settings) {
   }
 
   if (!entries) {
-    await debugLog('warn', 'glossary result: no array found in response', {
+    await debugLog('warn', 'glossary', 'glossary result: no array found in response', {
       type: typeof parsed,
       keys: parsed ? Object.keys(parsed).slice(0, 5) : [],
     });
@@ -312,8 +306,8 @@ export async function extractGlossary(compressedText, settings) {
     return { glossary: [], usage, _diag: `entries=${entries.length} but 0 valid (missing source/target?). samples: ${sampleDiag}` };
   }
 
-  await debugLog('info', 'glossary extraction done', {
-    totalEntries: entries.length, validTerms: glossary.length, ms, finishReason,
+  await debugLog('info', 'glossary', 'glossary extraction done', {
+    totalEntries: entries.length, validTerms: glossary.length, elapsed: ms, finishReason,
   });
 
   return { glossary, usage };
@@ -335,19 +329,21 @@ export async function extractGlossary(compressedText, settings) {
  * 但前綴（system prompt 那一大段）被 Gemini 內部 cache 省下。
  */
 export async function translateBatch(texts, settings, glossary) {
-  if (!texts?.length) return { translations: [], usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 } };
+  if (!texts?.length) return { translations: [], usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 }, hadMismatch: false };
   const out = new Array(texts.length);
   const usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
+  let hadMismatch = false; // v0.94: 追蹤本批是否有 segment mismatch
   const chunks = packChunks(texts);
   for (const { start, end } of chunks) {
     const slice = texts.slice(start, end);
-    const { parts, usage: u } = await translateChunk(slice, settings, glossary);
-    for (let j = 0; j < parts.length; j++) out[start + j] = parts[j];
-    usage.inputTokens += u.inputTokens;
-    usage.outputTokens += u.outputTokens;
-    usage.cachedTokens += u.cachedTokens || 0;
+    const result = await translateChunk(slice, settings, glossary);
+    for (let j = 0; j < result.parts.length; j++) out[start + j] = result.parts[j];
+    usage.inputTokens += result.usage.inputTokens;
+    usage.outputTokens += result.usage.outputTokens;
+    usage.cachedTokens += result.usage.cachedTokens || 0;
+    if (result.hadMismatch) hadMismatch = true;
   }
-  return { translations: out, usage };
+  return { translations: out, usage, hadMismatch };
 }
 
 async function translateChunk(texts, settings, glossary) {
@@ -360,12 +356,18 @@ async function translateChunk(texts, settings, glossary) {
     topP,
     topK,
     maxOutputTokens,
-    useThinking,
     systemInstruction,
   } = geminiConfig;
 
-  // 將多段以分隔符合併，單次請求省費用
-  const joined = texts.join(DELIMITER);
+  // v0.89: 多段時加序號標記，幫助模型追蹤段數，降低 segment mismatch 機率
+  // 格式：«1» text1 <<<SHINKANSEN_SEP>>> «2» text2 ...
+  // 使用 «» 而非 [] 避免跟原文的引註 [3] 或佔位符 ⟦⟧ 衝突。
+  // parse 時會用 regex 移除每段開頭的 «N» 前綴，不會洩漏到 DOM。
+  const useSeqMarkers = texts.length > 1;
+  const markedTexts = useSeqMarkers
+    ? texts.map((t, i) => `«${i + 1}» ${t}`)
+    : texts;
+  const joined = markedTexts.join(DELIMITER);
 
   // 若本批文字含 ⟦…⟧ 佔位符（content.js 為了保留連結 / 樣式而注入的）,
   // 在 systemInstruction 後面追加一條規則，要求 LLM 原樣保留這些標記。
@@ -382,7 +384,7 @@ async function translateChunk(texts, settings, glossary) {
   // 這裡明確告訴模型分隔符的完整字串和預期的段數，確保輸出格式正確。
   if (texts.length > 1) {
     effectiveSystem = effectiveSystem +
-      `\n\n額外規則（多段翻譯分隔符，極重要）:\n本批次包含 ${texts.length} 段文字，段與段之間以分隔符 <<<SHINKANSEN_SEP>>> 隔開。你的輸出也必須用完全相同的分隔符 <<<SHINKANSEN_SEP>>> 將各段譯文隔開。輸出必須恰好包含 ${texts.length} 段譯文和 ${texts.length - 1} 個分隔符，順序與輸入一一對應。不可合併段落、不可省略分隔符、不可增減段數。`;
+      `\n\n額外規則（多段翻譯分隔符與序號，極重要）:\n本批次包含 ${texts.length} 段文字。每段開頭有序號標記 «N»（N 為 1 到 ${texts.length}），段與段之間以分隔符 <<<SHINKANSEN_SEP>>> 隔開。\n你的輸出必須：\n- 每段譯文開頭也加上對應的序號標記 «N»（N 與輸入的序號一一對應）\n- 段與段之間用完全相同的分隔符 <<<SHINKANSEN_SEP>>> 隔開\n- 恰好輸出 ${texts.length} 段譯文和 ${texts.length - 1} 個分隔符\n- 不可合併段落、不可省略分隔符、不可增減段數`;
   }
 
   // v0.50: 若本批文字含段內換行（\n，來自序列化時 <br> 的還原）,追加一條規則
@@ -415,12 +417,8 @@ async function translateChunk(texts, settings, glossary) {
       topP,
       topK,
       maxOutputTokens,
-      // v0.77: 預設關閉思考功能（useThinking=false）。gemini-2.5-flash 是
-      // thinking model，思考 token 計入 maxOutputTokens 額度，可能導致輸出
-      // 截斷 → segment mismatch → per-segment fallback（極慢）。
-      // v0.79: 改為可透過設定頁開關控制。開啟時移除此限制，讓模型自行決定
-      // 思考預算（可能提高翻譯品質但增加延遲與 token 消耗）。
-      ...(useThinking ? {} : { thinkingConfig: { thinkingBudget: 0 } }),
+      // 關閉思考功能，避免思考 token 吃掉 maxOutputTokens 額度。
+      thinkingConfig: { thinkingBudget: 0 },
     },
     safetySettings: [
       { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
@@ -440,11 +438,10 @@ async function translateChunk(texts, settings, glossary) {
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
-  await debugLog('info', 'gemini request', { model, serviceTier, segments: texts.length });
+  await debugLog('info', 'api', 'gemini request', { model, serviceTier, segments: texts.length, chars: joined.length });
 
   const t0 = Date.now();
   const maxRetries = typeof settings?.maxRetries === 'number' ? settings.maxRetries : 3;
-  console.log(`[Shinkansen] translateChunk: sending ${texts.length} segments, ${joined.length} chars`);
   const resp = await fetchWithRetry(url, body, { maxRetries });
 
   // v0.84: resp.json() 加 try-catch。API 回傳非 JSON 時（HTML 錯誤頁、空回應、
@@ -457,16 +454,15 @@ async function translateChunk(texts, settings, glossary) {
     // 嘗試讀 raw text 取前 200 字元作為診斷線索
     let rawPreview = '';
     try { rawPreview = await resp.clone().text().then(t => t.slice(0, 200)); } catch { /* noop */ }
-    await debugLog('error', 'gemini response body is not JSON', {
-      status: resp.status, ms, parseError: parseErr.message, rawPreview,
+    await debugLog('error', 'api', 'gemini response body is not JSON', {
+      status: resp.status, elapsed: ms, parseError: parseErr.message, rawPreview,
     });
     throw new Error(`Gemini API 回應格式異常（非 JSON）：HTTP ${resp.status}。${rawPreview ? '回應前 200 字元：' + rawPreview : ''}`);
   }
   const ms = Date.now() - t0;
-  console.log(`[Shinkansen] translateChunk: API responded in ${ms}ms (${texts.length} segments)`);
 
   if (!resp.ok) {
-    await debugLog('error', 'gemini error', { status: resp.status, json, ms });
+    await debugLog('error', 'api', 'gemini error', { status: resp.status, elapsed: ms, error: json?.error?.message });
     const msg = json?.error?.message || `HTTP ${resp.status}`;
     throw new Error(msg);
   }
@@ -480,14 +476,14 @@ async function translateChunk(texts, settings, glossary) {
   // 檢查 promptFeedback（整個 prompt 被擋的情況，candidates 會是空陣列）
   const blockReason = json?.promptFeedback?.blockReason;
   if (blockReason) {
-    await debugLog('error', 'gemini prompt blocked', { blockReason, ms });
+    await debugLog('error', 'api', 'gemini prompt blocked', { blockReason, elapsed: ms });
     throw new Error(`Gemini 拒絕處理此請求（promptFeedback.blockReason: ${blockReason}）。可能是安全過濾器誤判，請嘗試縮短段落或調整內容。`);
   }
 
   // 檢查 candidates 為空或無文字輸出
   if (!candidate || !text) {
-    await debugLog('error', 'gemini empty candidates', {
-      ms, finishReason,
+    await debugLog('error', 'api', 'gemini empty candidates', {
+      elapsed: ms, finishReason,
       candidatesLength: json?.candidates?.length || 0,
       promptFeedback: json?.promptFeedback,
     });
@@ -505,8 +501,7 @@ async function translateChunk(texts, settings, glossary) {
 
   // finishReason 異常警告（有文字但不是正常結束）
   if (finishReason && finishReason !== 'STOP' && finishReason !== 'unknown') {
-    console.warn(`[Shinkansen] translateChunk: finishReason=${finishReason} (expected STOP) — output may be truncated`);
-    await debugLog('warn', 'gemini unusual finishReason', { finishReason, ms, textLength: text.length });
+    await debugLog('warn', 'api', 'gemini unusual finishReason', { finishReason, elapsed: ms, textLength: text.length });
   }
 
   const meta = json?.usageMetadata || {};
@@ -517,19 +512,22 @@ async function translateChunk(texts, settings, glossary) {
     // 未命中或舊模型時欄位不會出現，用 || 0 防呆。
     cachedTokens: meta.cachedContentTokenCount || 0,
   };
-  await debugLog('info', 'gemini response', {
-    ms,
-    usage: meta,
+  await debugLog('info', 'api', 'gemini response', {
+    elapsed: ms,
+    segments: texts.length,
+    inputTokens: chunkUsage.inputTokens,
+    outputTokens: chunkUsage.outputTokens,
+    cachedTokens: chunkUsage.cachedTokens,
     finishReason,
-    preview: text.slice(0, 200),
   });
 
-  const parts = text.split(DELIMITER).map(s => s.trim());
+  // v0.89: split 後移除序號標記 «N»（若有）
+  const SEQ_MARKER_RE = /^«\d+»\s*/;
+  const parts = text.split(DELIMITER).map(s => s.trim().replace(SEQ_MARKER_RE, ''));
   // 若回傳段數不符，且本批不只一段，則 fallback 改為逐段單獨翻譯，確保對齊
   if (parts.length !== texts.length) {
-    console.warn(`[Shinkansen] ⚠️ SEGMENT MISMATCH: expected ${texts.length} segments, got ${parts.length} — falling back to per-segment translation (this will be SLOW)`);
-    await debugLog('warn', 'segment count mismatch — fallback to per-segment', {
-      expected: texts.length, got: parts.length,
+    await debugLog('warn', 'api', 'segment count mismatch — fallback to per-segment', {
+      expected: texts.length, got: parts.length, elapsed: ms,
     });
     if (texts.length === 1) {
       // 單段模式：直接回傳整個 text(LLM 可能多吐了分隔符）
@@ -544,14 +542,14 @@ async function translateChunk(texts, settings, glossary) {
     for (let fi = 0; fi < texts.length; fi++) {
       const tSeg0 = Date.now();
       const r = await translateChunk([texts[fi]], settings, glossary);
-      console.log(`[Shinkansen]   fallback segment ${fi + 1}/${texts.length}: ${Date.now() - tSeg0}ms`);
+      await debugLog('info', 'api', `fallback segment ${fi + 1}/${texts.length}`, { elapsed: Date.now() - tSeg0 });
       aligned.push(r.parts[0] || '');
       aggUsage.inputTokens += r.usage.inputTokens;
       aggUsage.outputTokens += r.usage.outputTokens;
       aggUsage.cachedTokens += r.usage.cachedTokens || 0;
     }
-    console.log(`[Shinkansen] fallback complete: ${texts.length} segments in ${Date.now() - tFallback0}ms (original batch took ${ms}ms)`);
-    return { parts: aligned, usage: aggUsage };
+    await debugLog('warn', 'api', 'fallback complete', { segments: texts.length, fallbackElapsed: Date.now() - tFallback0, originalElapsed: ms });
+    return { parts: aligned, usage: aggUsage, hadMismatch: true };
   }
-  return { parts, usage: chunkUsage };
+  return { parts, usage: chunkUsage, hadMismatch: false };
 }

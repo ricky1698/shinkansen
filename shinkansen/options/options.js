@@ -57,11 +57,10 @@ const DEFAULTS = {
   geminiConfig: {
     model: 'gemini-3-flash-preview',
     serviceTier: 'DEFAULT',
-    temperature: 1.0,
+    temperature: 0.5,
     topP: 0.95,
     topK: 40,
     maxOutputTokens: 8192,
-    useThinking: true,
     systemInstruction: DEFAULT_SYSTEM_PROMPT,
   },
   pricing: {
@@ -70,7 +69,7 @@ const DEFAULTS = {
   },
   // v0.69: 術語表一致化
   glossary: {
-    enabled: true,
+    enabled: false,
     prompt: DEFAULT_GLOSSARY_PROMPT,
     temperature: 0.1,
     skipThreshold: 1,
@@ -80,7 +79,7 @@ const DEFAULTS = {
   },
   targetLanguage: 'zh-TW',
   domainRules: { whitelist: [], blacklist: [] },
-  autoTranslate: true,
+  autoTranslate: false,
   debugLog: false,
   tier: 'tier1',
   safetyMargin: 0.1,
@@ -94,45 +93,32 @@ const DEFAULTS = {
 // 模型參考價（Standard tier，每 1M tokens USD）— v0.64 更新
 // 來源：https://ai.google.dev/gemini-api/docs/pricing（2026-04-09 擷取）
 const MODEL_PRICING = {
-  'gemini-2.5-flash-lite':       { input: 0.10, output: 0.40 },
-  'gemini-3.1-flash-lite-preview': { input: 0.25, output: 1.50 },
-  'gemini-2.5-flash':            { input: 0.30, output: 2.50 },
+  'gemini-3.1-flash-lite-preview': { input: 0.10, output: 0.30 },
   'gemini-3-flash-preview':      { input: 0.50, output: 3.00 },
-  'gemini-2.5-pro':              { input: 1.25, output: 10.00 },
   'gemini-3.1-pro-preview':      { input: 2.00, output: 12.00 },
 };
 
 // Tier 對照表(與 lib/tier-limits.js 內容一致。options.js 是普通 script 不走 ES module,
-// 只能複製一份)。v0.64：移除 gemini-2.0-flash，新增 3 / 3.1 系列（preview 模型
-// 暫用保守估計值，rate limit 可能隨正式版調整）。
+// 只能複製一份)。v0.96：依 2026-04 AI Studio 實際數值全面更新。
+// Unlimited RPD 以 Infinity 表示。
 const TIER_LIMITS = {
   free: {
-    'gemini-2.5-pro':                { rpm: 5,   tpm: 250000,   rpd: 100 },
-    'gemini-2.5-flash':              { rpm: 10,  tpm: 250000,   rpd: 250 },
-    'gemini-2.5-flash-lite':         { rpm: 15,  tpm: 250000,   rpd: 1000 },
-    'gemini-3-flash-preview':        { rpm: 10,  tpm: 250000,   rpd: 250 },
-    'gemini-3.1-flash-lite-preview': { rpm: 15,  tpm: 250000,   rpd: 1000 },
-    'gemini-3.1-pro-preview':        { rpm: 5,   tpm: 250000,   rpd: 100 },
+    'gemini-3-flash-preview':        { rpm: 10,   tpm: 250000,   rpd: 250 },
+    'gemini-3.1-flash-lite-preview': { rpm: 15,   tpm: 250000,   rpd: 1000 },
+    'gemini-3.1-pro-preview':        { rpm: 5,    tpm: 250000,   rpd: 100 },
   },
   tier1: {
-    'gemini-2.5-pro':                { rpm: 150, tpm: 1000000,  rpd: 1000 },
-    'gemini-2.5-flash':              { rpm: 300, tpm: 2000000,  rpd: 1500 },
-    'gemini-2.5-flash-lite':         { rpm: 300, tpm: 2000000,  rpd: 1500 },
-    'gemini-3-flash-preview':        { rpm: 300, tpm: 2000000,  rpd: 1500 },
-    'gemini-3.1-flash-lite-preview': { rpm: 300, tpm: 2000000,  rpd: 1500 },
-    'gemini-3.1-pro-preview':        { rpm: 150, tpm: 1000000,  rpd: 1000 },
+    'gemini-3-flash-preview':        { rpm: 1000, tpm: 2000000,  rpd: 10000 },
+    'gemini-3.1-flash-lite-preview': { rpm: 4000, tpm: 4000000,  rpd: 150000 },
+    'gemini-3.1-pro-preview':        { rpm: 225,  tpm: 2000000,  rpd: 250 },
   },
   tier2: {
-    'gemini-2.5-pro':                { rpm: 1000, tpm: 2000000, rpd: 10000 },
-    'gemini-2.5-flash':              { rpm: 2000, tpm: 4000000, rpd: 10000 },
-    'gemini-2.5-flash-lite':         { rpm: 2000, tpm: 4000000, rpd: 10000 },
-    'gemini-3-flash-preview':        { rpm: 2000, tpm: 4000000, rpd: 10000 },
-    'gemini-3.1-flash-lite-preview': { rpm: 2000, tpm: 4000000, rpd: 10000 },
-    'gemini-3.1-pro-preview':        { rpm: 1000, tpm: 2000000, rpd: 10000 },
+    'gemini-3-flash-preview':        { rpm: 2000,  tpm: 3000000,  rpd: 100000 },
+    'gemini-3.1-flash-lite-preview': { rpm: 10000, tpm: 10000000, rpd: 350000 },
+    'gemini-3.1-pro-preview':        { rpm: 1000,  tpm: 5000000,  rpd: 50000 },
   },
 };
 
-// v0.64：取得實際模型字串（處理自行輸入的情況）
 function getSelectedModel() {
   const sel = $('model').value;
   if (sel === '__custom__') {
@@ -159,7 +145,8 @@ const SERVICE_TIER_MULTIPLIER = {
 
 // v0.64：模型變更 / Service Tier 變更 → 自動帶入參考價到模型計價欄位
 function applyModelPricing(model, tierOverride) {
-  const p = MODEL_PRICING[model];
+  const baseModel = model;
+  const p = MODEL_PRICING[baseModel];
   if (!p) return; // 自行輸入或查不到參考價時不動現有值
   const tier = tierOverride || $('serviceTier').value || 'DEFAULT';
   const mult = SERVICE_TIER_MULTIPLIER[tier] ?? 1.0;
@@ -185,7 +172,7 @@ function applyTierToInputs(tier, model) {
   const limits = table[model] || { rpm: 60, tpm: 1000000, rpd: 1000 };
   rpmEl.value = limits.rpm;
   tpmEl.value = limits.tpm;
-  rpdEl.value = limits.rpd;
+  rpdEl.value = limits.rpd === Infinity ? '無限制' : limits.rpd;
 }
 
 const $ = (id) => document.getElementById(id);
@@ -202,8 +189,6 @@ async function load() {
     apiKey: localApiKey,
   };
   $('apiKey').value = s.apiKey;
-  // v0.64：若存的模型不在 dropdown 選項裡（例如舊版的 gemini-2.0-flash 或使用者
-  // 自行輸入過的自訂模型），自動切到「自行輸入」並填入值
   const modelSelect = $('model');
   const savedModel = s.geminiConfig.model;
   const hasOption = [...modelSelect.options].some((o) => o.value === savedModel);
@@ -219,7 +204,6 @@ async function load() {
   $('topP').value = s.geminiConfig.topP;
   $('topK').value = s.geminiConfig.topK;
   $('maxOutputTokens').value = s.geminiConfig.maxOutputTokens;
-  $('useThinking').checked = s.geminiConfig.useThinking === true;
   $('systemInstruction').value = s.geminiConfig.systemInstruction;
   $('inputPerMTok').value = s.pricing.inputPerMTok;
   $('outputPerMTok').value = s.pricing.outputPerMTok;
@@ -260,7 +244,6 @@ async function save() {
       topP: Number($('topP').value),
       topK: Number($('topK').value),
       maxOutputTokens: Number($('maxOutputTokens').value),
-      useThinking: $('useThinking').checked,
       systemInstruction: $('systemInstruction').value,
     },
     pricing: {
@@ -294,9 +277,33 @@ async function save() {
   await chrome.storage.sync.set(settings);
   $('save-status').textContent = '✓ 已儲存';
   setTimeout(() => { $('save-status').textContent = ''; }, 2000);
+  // v0.94: 顯示綠色已儲存提示條
+  showSaveBar('saved', '設定已儲存');
 }
 
 $('save').addEventListener('click', save);
+
+// ─── v0.94: 儲存狀態提示條 ──────────────────────────────────
+let saveBarHideTimer = null;
+function showSaveBar(state, text) {
+  const bar = $('save-bar');
+  bar.textContent = text;
+  bar.className = 'save-bar ' + state; // 'dirty' 或 'saved'
+  bar.hidden = false;
+  if (saveBarHideTimer) clearTimeout(saveBarHideTimer);
+  if (state === 'saved') {
+    saveBarHideTimer = setTimeout(() => { bar.hidden = true; }, 3000);
+  }
+}
+function markDirty() {
+  const bar = $('save-bar');
+  // 若目前是「已儲存」狀態，不立即覆蓋（等它自己消失）
+  if (bar.classList.contains('saved') && !bar.hidden) return;
+  showSaveBar('dirty', '有未儲存的變更');
+}
+// 監聽設定分頁內所有 input / select / textarea 的變更
+document.getElementById('tab-settings').addEventListener('input', markDirty);
+document.getElementById('tab-settings').addEventListener('change', markDirty);
 
 // 顯示/隱藏 API Key 切換（v0.63）— 讓使用者能確認貼上去的 key 沒有貼錯
 $('toggle-api-key').addEventListener('click', () => {
@@ -346,14 +353,7 @@ $('reset-defaults').addEventListener('click', async () => {
   }, 3000);
 });
 
-$('view-logs').addEventListener('click', async () => {
-  const { shinkansenLogs = [] } = await chrome.storage.local.get('shinkansenLogs');
-  const view = $('log-view');
-  view.hidden = false;
-  view.textContent = shinkansenLogs.length
-    ? shinkansenLogs.slice(-100).map(l => JSON.stringify(l)).join('\n')
-    : '(尚無 Log)';
-});
+// v0.88: 舊的 view-logs 按鈕已移除，Log 改為獨立分頁
 
 $('export-settings').addEventListener('click', async () => {
   const all = await chrome.storage.sync.get(null);
@@ -417,7 +417,6 @@ function sanitizeImport(raw) {
       topP:             { type: 'number', min: 0, max: 1 },
       topK:             { type: 'number', min: 1, max: 100, int: true },
       maxOutputTokens:  { type: 'number', min: 256, max: 65535, int: true },
-      useThinking:      { type: 'boolean' },
       systemInstruction:{ type: 'string' },
     };
     for (const [key, rule] of Object.entries(gcRules)) {
@@ -529,6 +528,9 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     if (panel) panel.classList.add('active');
     // 切到用量頁時載入資料
     if (btn.dataset.tab === 'usage') loadUsageData();
+    // 切到 Log 頁時開始 polling
+    if (btn.dataset.tab === 'log') startLogPolling();
+    else stopLogPolling();
   });
 });
 
@@ -594,6 +596,7 @@ async function loadUsageData() {
   if (statsRes?.ok) {
     const s = statsRes.stats;
     $('usage-total-cost').textContent = fmtUSD(s.totalBilledCostUSD);
+    // v0.99: 思考 token 以 output 費率計費，加入總計
     $('usage-total-tokens').textContent = fmtTokens(s.totalBilledInputTokens + s.totalOutputTokens);
     $('usage-total-count').textContent = String(s.count);
     // 找最常用模型
@@ -734,6 +737,7 @@ function renderTable(records) {
   emptyMsg.hidden = true;
 
   tbody.innerHTML = records.map(r => {
+    // v0.99: 思考 token 以 output 費率計費，加入明細計算
     const billedTokens = (r.billedInputTokens || 0) + (r.outputTokens || 0);
     const shortModel = (r.model || '').replace('gemini-', '').replace('-preview', '');
     const title = escapeHtml(r.title || '(無標題)');
@@ -798,6 +802,216 @@ $('usage-clear').addEventListener('click', async () => {
     loadUsageData();
   } else {
     alert('清除失敗：' + (res?.error || '未知錯誤'));
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// v0.88: Log 分頁
+// ═══════════════════════════════════════════════════════════
+
+let logPollingTimer = null;
+let logLatestSeq = 0;
+let allLogs = [];          // 累積收到的全部 log entries
+
+// ─── Polling ────────────────────────────────────────────
+function startLogPolling() {
+  if (logPollingTimer) return;
+  fetchLogs();  // 立即拉一次
+  logPollingTimer = setInterval(fetchLogs, 2000);
+}
+
+function stopLogPolling() {
+  if (logPollingTimer) {
+    clearInterval(logPollingTimer);
+    logPollingTimer = null;
+  }
+}
+
+async function fetchLogs() {
+  try {
+    const res = await chrome.runtime.sendMessage({
+      type: 'GET_LOGS',
+      payload: { afterSeq: logLatestSeq },
+    });
+    if (!res?.ok) return;
+    if (res.logs && res.logs.length > 0) {
+      allLogs = allLogs.concat(res.logs);
+      // 前端也限制 buffer 上限，避免記憶體無限成長
+      if (allLogs.length > 2000) {
+        allLogs = allLogs.slice(allLogs.length - 2000);
+      }
+    }
+    if (res.latestSeq) logLatestSeq = res.latestSeq;
+    renderLogTable();
+  } catch {
+    // extension context invalidated 等情況，靜默
+  }
+}
+
+// ─── 篩選 ───────────────────────────────────────────────
+function getFilteredLogs() {
+  const catFilter = $('log-category-filter').value;
+  const lvlFilter = $('log-level-filter').value;
+  const search = ($('log-search').value || '').trim().toLowerCase();
+
+  return allLogs.filter(entry => {
+    if (catFilter && entry.category !== catFilter) return false;
+    if (lvlFilter && entry.level !== lvlFilter) return false;
+    if (search) {
+      const msg = (entry.message || '').toLowerCase();
+      const cat = (entry.category || '').toLowerCase();
+      const dataStr = entry.data ? JSON.stringify(entry.data).toLowerCase() : '';
+      if (!msg.includes(search) && !cat.includes(search) && !dataStr.includes(search)) {
+        return false;
+      }
+    }
+    return true;
+  });
+}
+
+// ─── 渲染 ───────────────────────────────────────────────
+const LOG_CAT_LABELS = {
+  translate:   'translate',
+  api:         'api',
+  cache:       'cache',
+  'rate-limit':'rate-limit',
+  glossary:    'glossary',
+  spa:         'spa',
+  system:      'system',
+};
+
+function renderLogTable() {
+  const tbody = $('log-tbody');
+  const emptyMsg = $('log-empty');
+  const filtered = getFilteredLogs();
+
+  // 更新計數
+  $('log-count').textContent = `${allLogs.length} 筆`;
+  const filteredCountEl = $('log-filtered-count');
+  if (filtered.length !== allLogs.length) {
+    filteredCountEl.textContent = `（篩選後 ${filtered.length} 筆）`;
+    filteredCountEl.hidden = false;
+  } else {
+    filteredCountEl.hidden = true;
+  }
+
+  if (filtered.length === 0) {
+    tbody.innerHTML = '';
+    emptyMsg.hidden = allLogs.length > 0 ? true : false;
+    if (allLogs.length > 0 && filtered.length === 0) {
+      emptyMsg.textContent = '沒有符合篩選條件的 Log';
+      emptyMsg.hidden = false;
+    } else if (allLogs.length === 0) {
+      emptyMsg.textContent = '尚無 Log。翻譯一個頁面後，Log 會自動出現在這裡';
+      emptyMsg.hidden = false;
+    }
+    return;
+  }
+  emptyMsg.hidden = true;
+
+  // 只渲染最近 500 筆（避免 DOM 太大）
+  const visible = filtered.slice(-500);
+
+  // 記住哪些 data detail 是展開的，渲染後還原
+  const openSet = new Set();
+  for (const el of tbody.querySelectorAll('.log-data-detail.open')) {
+    openSet.add(el.id);
+  }
+
+  tbody.innerHTML = visible.map(entry => {
+    const time = formatLogTime(entry.t);
+    const catClass = `log-cat log-cat-${entry.category || 'system'}`;
+    const catLabel = LOG_CAT_LABELS[entry.category] || entry.category || 'system';
+    const lvlClass = `log-lvl log-lvl-${entry.level || 'info'}`;
+    const lvlLabel = (entry.level || 'info').toUpperCase();
+    const rowClass = entry.level === 'error' ? 'log-row-error' :
+                     entry.level === 'warn'  ? 'log-row-warn'  : '';
+    const msg = escapeHtml(entry.message || '');
+
+    // data 展開按鈕
+    let dataHtml = '';
+    if (entry.data && Object.keys(entry.data).length > 0) {
+      const dataJson = JSON.stringify(entry.data, null, 2);
+      const dataId = `log-data-${entry.seq}`;
+      const isOpen = openSet.has(dataId);
+      dataHtml = `<button class="log-data-toggle" data-target="${dataId}">${isOpen ? '收合' : '{…}'}</button>` +
+        `<div class="log-data-detail${isOpen ? ' open' : ''}" id="${dataId}">${escapeHtml(dataJson)}</div>`;
+    }
+
+    return `<tr class="${rowClass}">` +
+      `<td class="log-col-time">${time}</td>` +
+      `<td class="log-col-cat"><span class="${catClass}">${catLabel}</span></td>` +
+      `<td class="log-col-lvl"><span class="${lvlClass}">${lvlLabel}</span></td>` +
+      `<td class="log-col-msg"><span class="log-msg-text">${msg}</span>${dataHtml}</td>` +
+      `</tr>`;
+  }).join('');
+
+  // 自動捲動到底部
+  if ($('log-autoscroll').checked) {
+    const wrapper = $('log-table-wrapper');
+    wrapper.scrollTop = wrapper.scrollHeight;
+  }
+}
+
+function formatLogTime(isoStr) {
+  try {
+    const d = new Date(isoStr);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    const ss = String(d.getSeconds()).padStart(2, '0');
+    return `${hh}:${mm}:${ss}`;
+  } catch {
+    return '??:??:??';
+  }
+}
+
+// ─── 使用者手動捲動時自動關閉 autoscroll ────────────────
+// 判斷邏輯：若使用者往上捲（不在底部），取消勾選；捲回底部則重新勾選
+$('log-table-wrapper').addEventListener('scroll', () => {
+  const w = $('log-table-wrapper');
+  // 距離底部 30px 以內視為「在底部」
+  const atBottom = w.scrollHeight - w.scrollTop - w.clientHeight < 30;
+  $('log-autoscroll').checked = atBottom;
+});
+
+// ─── Log 事件綁定 ───────────────────────────────────────
+$('log-category-filter').addEventListener('change', renderLogTable);
+$('log-level-filter').addEventListener('change', renderLogTable);
+$('log-search').addEventListener('input', renderLogTable);
+
+// 清除
+$('log-clear').addEventListener('click', async () => {
+  try {
+    await chrome.runtime.sendMessage({ type: 'CLEAR_LOGS' });
+  } catch { /* 靜默 */ }
+  allLogs = [];
+  logLatestSeq = 0;
+  renderLogTable();
+});
+
+// 匯出 JSON
+$('log-export').addEventListener('click', () => {
+  const filtered = getFilteredLogs();
+  const data = filtered.length !== allLogs.length ? filtered : allLogs;
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const ts = new Date().toISOString().slice(0, 19).replace(/[-:]/g, '').replace('T', '-');
+  a.href = url;
+  a.download = `shinkansen-log-${ts}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+// Data 展開/收合（event delegation）
+$('log-tbody').addEventListener('click', (e) => {
+  const toggle = e.target.closest('.log-data-toggle');
+  if (!toggle) return;
+  const targetId = toggle.dataset.target;
+  const detail = document.getElementById(targetId);
+  if (detail) {
+    detail.classList.toggle('open');
+    toggle.textContent = detail.classList.contains('open') ? '收合' : '{…}';
   }
 });
 

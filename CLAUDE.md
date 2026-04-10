@@ -182,21 +182,67 @@
 
 ## 工作風格偏好
 
-### 除錯時：先用 Chrome MCP 自行驗證，不要什麼都要使用者截圖
+### 除錯時：自動化優先，不要什麼都要使用者截圖
+
+**這是長期開發方向**：Claude 除錯時應盡可能自動化地讀取資訊、診斷問題，讓 Jimmy 只需要在最後一步（reload extension + 按快捷鍵）手動介入。
 
 - 我有 `mcp__Claude_in_Chrome__*` 工具，可以 navigate 到測試頁、跑 JavaScript、讀 DOM、檢查選擇器
 - 使用者曾明確說：「有沒有方法能讓你自行測試，自行重新載入，自行修改而不需要我截圖？」
-- **標準除錯流程**：
-  1. 用 Chrome MCP navigate 到實際網頁
-  2. 注入跟 content.js 相同的偵測邏輯跑一次
-  3. 收集真實 DOM 結構與選擇器命中狀況
-  4. 根據真實資料判斷 bug 原因（不要靠猜）
-  5. 改完 code 後再跑一次模擬驗證
-  6. 最後才請使用者 reload extension 驗收
-- **限制**：
-  - 不能直接 reload extension（`chrome://extensions/` 是受保護頁面）
-  - 不能模擬 Chrome 層級的快捷鍵（Option+S）
-  - 所以最後一步一定要使用者手動 reload 並按快捷鍵
+
+#### Debug Bridge（v0.88 起可用）
+
+`content.js` 內建了 main world ↔ isolated world 的 CustomEvent 橋接，Claude 可以在**任何載入了 content script 的頁面**上用 Chrome MCP `javascript_tool` 讀取 extension 的 Log buffer：
+
+```js
+// 讀取全部 log（或帶 afterSeq 做差異查詢）
+new Promise(r => {
+  window.addEventListener('shinkansen-debug-response', e => r(e.detail), { once: true });
+  window.dispatchEvent(new CustomEvent('shinkansen-debug-request',
+    { detail: { action: 'GET_LOGS', afterSeq: 0 } }));
+  setTimeout(() => r('TIMEOUT'), 5000);
+});
+```
+
+支援的 action：`GET_LOGS`（帶 `afterSeq` 參數）、`CLEAR_LOGS`。
+
+#### 標準除錯流程
+
+1. 用 Chrome MCP navigate 到出問題的網頁
+2. **透過 Debug Bridge 拉 Log**：篩選 warn / error，讀取結構化 data 欄位
+3. 根據 Log 資料判斷 bug 原因（不要靠猜）
+4. 若 Log 資訊不足，再用 Chrome MCP 注入 JS 讀 DOM、檢查選擇器
+5. 改完 code 後，請使用者 reload extension 驗收
+6. 驗收後再透過 bridge 確認 log 是否乾淨
+
+#### 自動除錯流程（v0.88 起可用，優先使用）
+
+Debug Bridge 除了 `GET_LOGS` / `CLEAR_LOGS`，還支援操控翻譯流程的 action：
+- `CLEAR_CACHE` — 清除翻譯快取（**除錯前必做，否則 cache hit 會遮蔽 API 行為**）
+- `TRANSLATE` — 觸發 translatePage()，等同使用者按 Option+S
+- `RESTORE` — 還原原文
+- `GET_STATE` — 回傳 `{ translated, translating, segmentCount }`
+
+完整自動除錯循環（Claude 自行完成，不需要使用者介入）：
+1. Chrome MCP navigate 到目標頁面
+2. Bridge `CLEAR_CACHE`（清快取）
+3. Bridge `CLEAR_LOGS`（清 log，確保只看本次翻譯的 log）
+4. Bridge `TRANSLATE`（觸發翻譯）
+5. 輪詢 `GET_STATE` 等待 `translating === false`
+6. Bridge `GET_LOGS` 拉 log，分析 warn / error
+7. 若有 bug → 改 code → **請使用者 reload extension**（唯一需要人工介入的步驟）→ 回到步驟 1 驗證
+
+**重要**：除錯時清快取是必要步驟，不清快取等於在看舊結果。
+
+#### 遇到 Log 系統能力不足時
+
+如果除錯過程中發現 Log 缺少關鍵欄位、缺少某類事件的記錄、或 bridge 無法到達某個情境（例如 extension 頁面本身、service worker crash），**必須主動提醒 Jimmy**：「Log 系統在這方面的記錄不足，要不要讓我加強？」——不要默默放棄自動化、回到請使用者截圖的舊路徑。
+
+#### 限制
+
+- 不能直接 reload extension（`chrome://extensions/` 是受保護頁面）
+- 不能模擬 Chrome 層級的快捷鍵（Option+S）
+- 所以最後一步一定要使用者手動 reload 並按快捷鍵
+- Debug Bridge 只在有 content script 的頁面上可用（extension 內部頁面如 options.html 不行）
 
 ### 修正 bug 的方向優先序
 

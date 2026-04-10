@@ -18,6 +18,85 @@
     originalHTML: new Map(), // el → originalHTML
   };
 
+  // ─── v0.88: 統一 Log 系統（透過 message 送到 background buffer） ───
+  // content.js 不能 import ES module，用 sendMessage 代替。
+  // 即使 sendMessage 失敗（例如 SW 尚未啟動）也不會影響正常運作。
+  function sendLog(level, category, message, data) {
+    try {
+      chrome.runtime.sendMessage({
+        type: 'LOG',
+        payload: { level, category, message, data },
+      }).catch(() => {}); // fire-and-forget
+    } catch { /* 靜默 */ }
+  }
+
+  // ─── v0.88: Debug Bridge（讓 Chrome MCP 從 main world 操控 extension） ──
+  // Chrome MCP 的 JS 跑在 main world，拿不到 chrome.runtime 也碰不到
+  // content script IIFE 裡的函式。這座橋透過 CustomEvent 讓 main world
+  // 可以：讀取 Log、清除 Log、清除翻譯快取、觸發翻譯、還原原文。
+  //
+  // 用法（在 Chrome MCP javascript_tool 裡）：
+  //   new Promise(r => {
+  //     window.addEventListener('shinkansen-debug-response', e => r(e.detail), { once: true });
+  //     window.dispatchEvent(new CustomEvent('shinkansen-debug-request',
+  //       { detail: { action: 'GET_LOGS', afterSeq: 0 } }));
+  //     setTimeout(() => r('TIMEOUT'), 5000);
+  //   });
+  //
+  // 支援的 action：
+  //   GET_LOGS    — 帶 afterSeq 參數，差異查詢 log buffer
+  //   CLEAR_LOGS  — 清空 log buffer
+  //   CLEAR_CACHE — 清除翻譯快取（透過 background CLEAR_CACHE 訊息）
+  //   TRANSLATE   — 觸發 translatePage()（等同按 Option+S）
+  //   RESTORE     — 還原原文（若目前為翻譯狀態）
+  //   GET_STATE   — 回傳目前翻譯狀態 { translated, translating, segmentCount }
+  window.addEventListener('shinkansen-debug-request', (e) => {
+    const { action, afterSeq } = (e.detail || {});
+    const respond = (detail) => {
+      window.dispatchEvent(new CustomEvent('shinkansen-debug-response', { detail }));
+    };
+
+    if (action === 'GET_LOGS') {
+      chrome.runtime.sendMessage(
+        { type: 'GET_LOGS', payload: { afterSeq: afterSeq || 0 } },
+        (res) => respond(res || { ok: false, error: 'no response' }),
+      );
+    } else if (action === 'CLEAR_LOGS') {
+      chrome.runtime.sendMessage({ type: 'CLEAR_LOGS' }, (res) => {
+        respond(res || { ok: true });
+      });
+    } else if (action === 'CLEAR_CACHE') {
+      chrome.runtime.sendMessage({ type: 'CLEAR_CACHE' }, (res) => {
+        respond(res || { ok: true });
+      });
+    } else if (action === 'TRANSLATE') {
+      // 非同步觸發翻譯，立刻回應「已觸發」
+      respond({ ok: true, triggered: true });
+      translatePage();
+    } else if (action === 'RESTORE') {
+      if (STATE.translated) {
+        restorePage();
+        respond({ ok: true, restored: true });
+      } else {
+        respond({ ok: false, error: 'not translated' });
+      }
+    } else if (action === 'CLEAR_RPD') {
+      // v0.89: 清除 RPD 計數（測試用，解決累積到上限的問題）
+      chrome.runtime.sendMessage({ type: 'CLEAR_RPD' }, (res) => {
+        respond(res || { ok: true });
+      });
+    } else if (action === 'GET_STATE') {
+      respond({
+        ok: true,
+        translated: STATE.translated,
+        translating: STATE.translating,
+        segmentCount: STATE.originalHTML.size,
+      });
+    } else {
+      respond({ ok: false, error: 'unknown action: ' + action });
+    }
+  });
+
   // ─── Toast 提示 （Shadow DOM 隔離） ─────────────────────
   const toastHost = document.createElement('div');
   toastHost.id = 'shinkansen-toast-host';
@@ -102,6 +181,15 @@
       }
       .toast.success .bar-fill { background: #34c759; width: 100%; }
       .toast.error   .bar-fill { background: #ff3b30; width: 100%; }
+      /* v0.94: mismatch fallback 時進度條黃色閃爍 */
+      .toast.mismatch .bar-fill {
+        background: #ff9500;
+        animation: blink-yellow .6s ease-in-out infinite;
+      }
+      @keyframes blink-yellow {
+        0%, 100% { opacity: 1; }
+        50%      { opacity: .4; }
+      }
     </style>
     <div class="toast" id="toast">
       <div class="row">
@@ -175,6 +263,8 @@
     // 組合 class
     const classes = ['toast', 'show', kind];
     if (kind === 'loading' && opts.progress == null) classes.push('indeterminate');
+    // v0.94: mismatch fallback 時加上 mismatch class → 進度條黃色閃爍
+    if (opts.mismatch) classes.push('mismatch');
     toastEl.className = classes.join(' ');
     toastMsgEl.textContent = msg;
 
@@ -787,16 +877,43 @@
 
   // 剝除譯文中殘留、未成功配對的佔位符標記(開頭、結尾或自閉合),只保留文字。
   // 例:'⟦5⟧bay' → 'bay';'estuary⟦/5⟧' → 'estuary';'foo⟦*3⟧bar' → 'foobar'
+  //
+  // v0.92: LLM 有時會丟掉 ⟦ 但保留 ⟧，導致殘留 orphan ⟧ 或 /N⟧ 等半截標記。
+  // ⟦ (U+27E6) 與 ⟧ (U+27E7) 是數學方括號，自然語言文本幾乎不會出現，
+  // 因此在剝除完整標記後再清除所有殘留的 ⟦ / ⟧ 是安全的。
   function stripStrayPlaceholderMarkers(s) {
-    return s.replace(new RegExp(PH_OPEN + '\\*?\\/?\\d+' + PH_CLOSE, 'g'), '');
+    // 第一步：剝除完整標記 ⟦0⟧、⟦/0⟧、⟦*0⟧
+    s = s.replace(new RegExp(PH_OPEN + '\\*?\\/?\\d+' + PH_CLOSE, 'g'), '');
+    // 第二步：剝除 LLM 漏掉 ⟦ 後殘留的半截標記（例 /0⟧、*2⟧）
+    s = s.replace(new RegExp('[\\*\\/]\\d+' + PH_CLOSE, 'g'), '');
+    // 第三步：清除任何殘留的孤立 ⟦ 或 ⟧（含 LLM 替代字元 ❰❱）
+    s = s.replace(new RegExp('[' + PH_OPEN + PH_CLOSE +
+      BRACKET_ALIASES_OPEN.join('') + BRACKET_ALIASES_CLOSE.join('') + ']', 'g'), '');
+    return s;
   }
 
   // 把佔位符 ⟦…⟧ 內部多餘空白收掉:⟦ 0 ⟧ → ⟦0⟧、⟦ /3 ⟧ → ⟦/3⟧、⟦ *5 ⟧ → ⟦*5⟧
   // 範圍嚴格鎖在 ⟦…⟧ 之間,不會誤傷譯文本身的格式。
   // (LLM 對佔位符的「全形化」傾向 ── 例如把 ⟦0⟧ 寫成 ⟦０⟧ ── 是 system prompt
   // 的責任,不在這裡 normalize,以免和 prompt 規則互相衝突或誤傷正文。)
+  //
+  // v0.93: LLM 有時會把 ⟦⟧ (U+27E6/U+27E7) 替換成外觀相似但 Unicode 不同的
+  // 括號字元,導致整個反序列化管線認不出標記。已觀察到的替代字元:
+  //   - ❰❱ (U+2770/U+2771) Heavy Left/Right-Pointing Angle Bracket Ornament
+  // 這些字元在自然語言中幾乎不使用,還原成 ⟦⟧ 是安全的。
+  // 若未來觀察到其他替代字元,加到 BRACKET_ALIASES 即可。
+  const BRACKET_ALIASES_OPEN = ['\u2770'];  // ❰
+  const BRACKET_ALIASES_CLOSE = ['\u2771']; // ❱
   function normalizeLlmPlaceholders(s) {
     if (!s) return s;
+    // 第零步：把 LLM 替代括號還原成標準 ⟦⟧
+    for (const alias of BRACKET_ALIASES_OPEN) {
+      if (s.includes(alias)) s = s.split(alias).join(PH_OPEN);
+    }
+    for (const alias of BRACKET_ALIASES_CLOSE) {
+      if (s.includes(alias)) s = s.split(alias).join(PH_CLOSE);
+    }
+    // 收掉 ⟦…⟧ 內部多餘空白
     return s.replace(
       new RegExp(PH_OPEN + '\\s*(\\*?\\/?\\d+)\\s*' + PH_CLOSE, 'g'),
       PH_OPEN + '$1' + PH_CLOSE
@@ -863,7 +980,7 @@
     for (const l of losers) {
       out = out.slice(0, l.start) + l.inner + out.slice(l.end);
     }
-    console.log('[Shinkansen v0.57] graceful dedup: dup_slots=' + dupSlotCount +
+    sendLog('info', 'translate', 'graceful dedup: dup_slots=' + dupSlotCount +
       ' losers_demoted=' + losers.length +
       ' preview=' + JSON.stringify(out.slice(0, 200)));
     return out;
@@ -1156,7 +1273,7 @@
   // v0.37 起改為「字元預算 + 段數上限」雙門檻的 greedy 打包，以避免單批
   // token 數暴衝（例如 20 個 Stratechery 論述段）或 slot 過多導致 LLM
   // 對齊失準。任一門檻先達到就封口開新批次；單段本身超過預算時獨佔一批。
-  const MAX_UNITS_PER_BATCH = 20;        // 段數上限（原 CHUNK_SIZE）
+  const MAX_UNITS_PER_BATCH = 12;        // 段數上限（v0.91 從 20 降為 12，降低 mismatch 觸發率）
   const MAX_CHARS_PER_BATCH = 3500;      // 字元預算，作為 token proxy（≈ 1000 英文 tokens，留 output headroom）
   const DEFAULT_MAX_CONCURRENT = 10; // content.js 側並發上限（與 background 的 rate limiter 雙重保險）
   // v0.81: 單頁翻譯段落總數上限。超大頁面（如維基百科年表條目）可能收集到
@@ -1319,17 +1436,19 @@
     };
     const jobs = packBatches(texts, units, slotsList);
     const failures = [];
+    let rpdWarning = false; // v0.90: RPD 軟性預算警告旗標
+    let hadAnyMismatch = false; // v0.94: 是否有任何 batch 觸發 segment mismatch
 
     // v0.76: 每批計時 log，診斷「前快後慢」問題
     const t0All = Date.now();
-    console.log(`[Shinkansen] translateUnits: ${jobs.length} batches, ${total} units, maxConcurrent=${maxConcurrent}`);
+    sendLog('info', 'translate', 'translateUnits start', { batches: jobs.length, total, maxConcurrent });
 
     await runWithConcurrency(jobs, maxConcurrent, async (job) => {
       // v0.80: 若翻譯已被取消，跳過剩餘批次
       if (signal?.aborted) return;
       const batchIdx = jobs.indexOf(job);
       const t0 = Date.now();
-      console.log(`[Shinkansen] batch ${batchIdx + 1}/${jobs.length} start: ${job.texts.length} units, ${job.chars} chars`);
+      sendLog('info', 'translate', `batch ${batchIdx + 1}/${jobs.length} start`, { units: job.texts.length, chars: job.chars });
       try {
         const response = await chrome.runtime.sendMessage({
           type: 'TRANSLATE_BATCH',
@@ -1338,7 +1457,7 @@
         const elapsed = Date.now() - t0;
         const cacheHit = response?.usage?.cacheHits || 0;
         const apiCalls = job.texts.length - cacheHit;
-        console.log(`[Shinkansen] batch ${batchIdx + 1}/${jobs.length} done: ${elapsed}ms (${cacheHit} cached, ${apiCalls} API calls)`);
+        sendLog('info', 'translate', `batch ${batchIdx + 1}/${jobs.length} done`, { elapsed, cacheHits: cacheHit, apiCalls });
         if (!response?.ok) throw new Error(response?.error || '未知錯誤');
         const translations = response.result;
         if (response.usage) {
@@ -1350,19 +1469,23 @@
           pageUsage.billedCostUSD += response.usage.billedCostUSD || 0;
           pageUsage.cacheHits += response.usage.cacheHits || 0;
         }
+        // v0.90: 追蹤 RPD 軟性預算警告
+        if (response.rpdExceeded) rpdWarning = true;
+        // v0.94: 追蹤 mismatch fallback
+        if (response.hadMismatch) hadAnyMismatch = true;
         translations.forEach((tr, j) => injectTranslation(job.units[j], tr, job.slots[j]));
         done += job.texts.length;
-        if (onProgress) onProgress(done, total);
+        if (onProgress) onProgress(done, total, hadAnyMismatch);
       } catch (err) {
         const elapsed = Date.now() - t0;
-        console.warn(`[Shinkansen] batch ${batchIdx + 1}/${jobs.length} FAILED after ${elapsed}ms`, { start: job.start, error: err.message });
+        sendLog('error', 'translate', `batch ${batchIdx + 1}/${jobs.length} FAILED`, { elapsed, start: job.start, error: err.message });
         failures.push({ start: job.start, count: job.texts.length, error: err.message });
       }
     });
 
-    console.log(`[Shinkansen] translateUnits complete: ${Date.now() - t0All}ms total, ${done}/${total} done, ${failures.length} failures`);
+    sendLog('info', 'translate', 'translateUnits complete', { elapsed: Date.now() - t0All, done, total, failures: failures.length });
 
-    return { done, total, failures, pageUsage };
+    return { done, total, failures, pageUsage, rpdWarning };
   }
 
   async function translatePage() {
@@ -1373,7 +1496,7 @@
 
     // v0.80: 翻譯進行中 → 使用者再按一次 = 取消翻譯
     if (STATE.translating) {
-      console.log('[Shinkansen] aborting in-progress translation');
+      sendLog('info', 'translate', 'aborting in-progress translation');
       STATE.abortController?.abort();
       showToast('loading', '正在取消翻譯⋯');
       return;
@@ -1414,7 +1537,7 @@
     let truncatedCount = 0;
     if (units.length > MAX_TOTAL_UNITS) {
       truncatedCount = units.length - MAX_TOTAL_UNITS;
-      console.warn(`[Shinkansen] page has ${units.length} units, truncating to ${MAX_TOTAL_UNITS} (skipping last ${truncatedCount})`);
+      sendLog('warn', 'translate', 'page truncated', { total: units.length, limit: MAX_TOTAL_UNITS, skipped: truncatedCount });
       units = units.slice(0, MAX_TOTAL_UNITS);
     }
     const total = units.length;
@@ -1463,7 +1586,7 @@
       // 需要建術語表
       const compressedText = extractGlossaryInput(units);
       const inputHash = await sha1(compressedText);
-      console.log(`[Shinkansen] glossary: batchCount=${batchCount}, mode=${batchCount > blockingThreshold ? 'blocking' : 'fire-and-forget'}, compressedChars=${compressedText.length}, hash=${inputHash.slice(0, 8)}`);
+      sendLog('info', 'glossary', 'glossary preprocessing', { batchCount, mode: batchCount > blockingThreshold ? 'blocking' : 'fire-and-forget', compressedChars: compressedText.length, hash: inputHash.slice(0, 8) });
 
       if (batchCount > blockingThreshold) {
         // ─── 長文：阻塞等術語表 ─────────────────────
@@ -1480,18 +1603,14 @@
           ]);
           if (glossaryResult?.ok && glossaryResult.glossary?.length > 0) {
             glossary = glossaryResult.glossary;
-            console.log(`[Shinkansen] glossary ready: ${glossary.length} terms`
-              + (glossaryResult.fromCache ? ' (cached)' : ''));
+            sendLog('info', 'glossary', 'glossary ready', { terms: glossary.length, fromCache: !!glossaryResult.fromCache });
           } else if (glossaryResult?.ok) {
-            console.warn('[Shinkansen] glossary returned ok but empty (no terms extracted)',
-              glossaryResult.fromCache ? '[FROM CACHE — 上次的空結果被快取了，請清除快取再試]' : '',
-              glossaryResult._diag ? `diag: ${glossaryResult._diag}` : '',
-              `usage: in=${glossaryResult.usage?.inputTokens || 0} out=${glossaryResult.usage?.outputTokens || 0}`);
+            sendLog('warn', 'glossary', 'glossary returned empty', { fromCache: glossaryResult.fromCache, diag: glossaryResult._diag, inputTokens: glossaryResult.usage?.inputTokens || 0, outputTokens: glossaryResult.usage?.outputTokens || 0 });
           } else {
-            console.warn('[Shinkansen] glossary returned not ok:', glossaryResult?.error, glossaryResult?._diag);
+            sendLog('warn', 'glossary', 'glossary returned not ok', { error: glossaryResult?.error, diag: glossaryResult?._diag });
           }
         } catch (err) {
-          console.warn('[Shinkansen] glossary failed/timeout, proceeding without', err.message);
+          sendLog('warn', 'glossary', 'glossary failed/timeout, proceeding without', { error: err.message });
         }
       } else {
         // ─── 中檔：fire-and-forget，第一批不等 ──────────
@@ -1501,12 +1620,12 @@
           payload: { compressedText, inputHash },
         }).then(res => {
           if (res?.ok && res.glossary?.length > 0) {
-            console.log(`[Shinkansen] glossary arrived (async): ${res.glossary.length} terms`);
+            sendLog('info', 'glossary', 'glossary arrived (async)', { terms: res.glossary.length });
             return res.glossary;
           }
           return null;
         }).catch(err => {
-          console.warn('[Shinkansen] glossary async failed', err.message);
+          sendLog('warn', 'glossary', 'glossary async failed', { error: err.message });
           return null;
         });
         // 把 promise 存到 STATE 上，translateUnits 的 mid-flight 策略會用到
@@ -1533,17 +1652,18 @@
         STATE._glossaryPromise = null;
       }
 
-      const { done, failures, pageUsage } = await translateUnits(units, {
+      const { done, failures, pageUsage, rpdWarning } = await translateUnits(units, {
         glossary,
         signal: abortSignal,
-        onProgress: (d, t) => showToast('loading', `翻譯中… ${d} / ${t}`, {
+        onProgress: (d, t, mismatch) => showToast('loading', `翻譯中… ${d} / ${t}`, {
           progress: d / t,
+          mismatch: !!mismatch, // v0.94: mismatch 時進度條黃色閃爍
         }),
       });
 
       // v0.80: 若翻譯被中途取消，還原已注入的部分譯文並清理
       if (abortSignal.aborted) {
-        console.log(`[Shinkansen] translation aborted: ${done}/${total} done before cancel`);
+        sendLog('info', 'translate', 'translation aborted', { done, total });
         if (STATE.originalHTML.size > 0) {
           // 還原已注入的部分譯文
           STATE.originalHTML.forEach((originalHTML, el) => {
@@ -1601,8 +1721,8 @@
         } else if (pageUsage.cacheHits === total) {
           detail = '全部快取命中 · 本次未計費';
         }
-        // 把完整 usage 印到 console，方便事後在 DevTools 查實際數字（v0.48 更新欄位）
-        console.log('[Shinkansen] page usage', {
+        // v0.88: 完整 usage 送到 Log 系統
+        sendLog('info', 'translate', 'page translation usage', {
           segments: total,
           inputTokens: pageUsage.inputTokens,
           cachedTokens: pageUsage.cachedTokens,
@@ -1612,12 +1732,9 @@
           implicitCacheHitRate: pageUsage.inputTokens > 0
             ? `${((pageUsage.cachedTokens / pageUsage.inputTokens) * 100).toFixed(1)}%`
             : 'n/a',
-          originalCostUSD: pageUsage.costUSD,
           billedCostUSD: pageUsage.billedCostUSD,
-          costSavedRate: pageUsage.costUSD > 0
-            ? `${(((pageUsage.costUSD - pageUsage.billedCostUSD) / pageUsage.costUSD) * 100).toFixed(1)}%`
-            : 'n/a',
           localCacheHitSegments: pageUsage.cacheHits,
+          url: location.href,
         });
         showToast('success', successMsg, {
           progress: 1,
@@ -1646,6 +1763,17 @@
         }).catch(() => {}); // 靜默：紀錄失敗不影響使用者體驗
       }
 
+      // v0.90: RPD 軟性預算警告——翻譯正常完成，但提示已超過每日預算
+      if (rpdWarning) {
+        // 延遲 1.5 秒顯示，避免跟成功 toast 打架
+        setTimeout(() => {
+          showToast('error', '提醒：今日 API 請求次數已超過預算上限', {
+            detail: '翻譯仍可正常使用，但請留意用量。每日計數於太平洋時間午夜重置（約台灣時間下午 3 點）',
+            autoHideMs: 6000,
+          });
+        }, 1500);
+      }
+
       // v0.45: 安排延遲 rescan 補抓 hydration 後才 render 的內容
       // (例如 Nikkei 的 READ NEXT 區,Next.js 把它放在 hydration 之後才 mount)
       scheduleRescanForLateContent();
@@ -1653,7 +1781,7 @@
       // v0.82: 翻譯完成後啟動 MutationObserver，偵測 SPA 動態新增段落
       startSpaObserver();
     } catch (err) {
-      console.error('[Shinkansen]', err);
+      sendLog('error', 'translate', 'translatePage error', { error: err.message || String(err) });
       // v0.80: 若是 abort 觸發的錯誤，不顯示「翻譯失敗」
       if (!abortSignal.aborted) {
         showToast('error', `翻譯失敗:${err.message}`, { stopTimer: true });
@@ -1722,14 +1850,10 @@
         // 改成只 console.log 讓需要的人自己去 DevTools 看。
         // 失敗原本就靜默(console.warn 在 translateUnits 內做),成功比照辦理。
         if (done > 0) {
-          console.log('[Shinkansen] rescan 補抓', {
-            done,
-            failures: failures.length,
-            attempt: rescanAttempts + 1,
-          });
+          sendLog('info', 'translate', 'rescan caught new units', { done, failures: failures.length, attempt: rescanAttempts + 1 });
         }
       } catch (err) {
-        console.warn('[Shinkansen] rescan failed', err);
+        sendLog('warn', 'translate', 'rescan failed', { error: err.message });
       }
     }
     // 即使這次沒抓到內容,也再試一次(頁面可能還在 hydrate)
@@ -1800,20 +1924,10 @@
         el.setAttribute('data-shinkansen-translated', '1');
         return;
       }
-      // fallback：把譯文中的 ⟦N⟧⟦/N⟧ 標記去掉,走 plain-text 替換。
-      //
-      // v0.52: 之前用 replaceTextInPlace 把譯文塞進「最長文字節點」,但對於
-      // Wikipedia ambox 這種「最長文字節點剛好在 <I><SMALL><A> 裡面」的
-      // 結構,Chinese 會繼承 italic/small/link 樣式,看起來像 v0.51 的失敗
-      // 視覺(雖然結構不再錯亂)。改用 plainTextFallback：直接寫到 el 本身
-      // 的 textContent,只在 MJML 之類「el 自己 font-size:0」的特殊情況下
-      // 才退到 inner wrapper,避免 ambox 的 inline ancestor 把樣式繼承下來。
-      // v0.52: 含 `\\*?` 才能順便清掉原子型佔位符 `⟦*N⟧`(像 Wikipedia
-      // sup.reference 腳註),不然這些 token 會以字面形式留在 fallback 文字裡。
-      const cleaned = translation.replace(
-        new RegExp(PH_OPEN + '\\*?\\/?\\d+' + PH_CLOSE, 'g'),
-        ''
-      );
+      // fallback：把譯文中的佔位符標記去掉,走 plain-text 替換。
+      // v0.92: 改用共用的 stripStrayPlaceholderMarkers，確保 orphan ⟧ 等
+      // 半截標記也被清除（與 parseSegment 內的 pushText 路徑一致）。
+      const cleaned = stripStrayPlaceholderMarkers(translation);
       plainTextFallback(el, cleaned);
       el.setAttribute('data-shinkansen-translated', '1');
       return;
@@ -2193,7 +2307,7 @@
     chrome.runtime.sendMessage({ type: 'CLEAR_BADGE' }).catch(() => {});
     // 關掉 toast
     hideToast();
-    console.log('[Shinkansen] SPA navigation detected, state reset');
+    sendLog('info', 'spa', 'SPA navigation detected, state reset', { url: location.href });
   }
 
   /**
@@ -2222,13 +2336,13 @@
           return hostname === pattern;
         });
         if (isWhitelisted) {
-          console.log('[Shinkansen] SPA nav: domain whitelisted, auto-translating');
+          sendLog('info', 'spa', 'SPA nav: domain whitelisted, auto-translating', { url: location.href });
           translatePage();
           return;
         }
       }
     } catch (err) {
-      console.warn('[Shinkansen] SPA nav: failed to check whitelist', err);
+      sendLog('warn', 'spa', 'SPA nav: failed to check whitelist', { error: err.message });
     }
     // 不在白名單 → 不自動翻譯，使用者可手動按 Alt+S
   }
@@ -2268,7 +2382,7 @@
       childList: true,
       subtree: true,
     });
-    console.log('[Shinkansen] SPA observer started');
+    sendLog('info', 'spa', 'SPA observer started');
   }
 
   function stopSpaObserver() {
@@ -2307,7 +2421,7 @@
     spaObserverDebounceTimer = null;
     if (!STATE.translated) return;
     if (spaObserverRescanCount >= SPA_OBSERVER_MAX_RESCANS) {
-      console.log(`[Shinkansen] SPA observer: reached max rescans (${SPA_OBSERVER_MAX_RESCANS}), stopping`);
+      sendLog('info', 'spa', 'SPA observer: reached max rescans, stopping', { maxRescans: SPA_OBSERVER_MAX_RESCANS });
       stopSpaObserver();
       return;
     }
@@ -2318,20 +2432,19 @@
 
     // 上限保護：每次 rescan 最多翻譯 SPA_OBSERVER_MAX_UNITS 段
     if (newUnits.length > SPA_OBSERVER_MAX_UNITS) {
-      console.warn(`[Shinkansen] SPA observer rescan: ${newUnits.length} new units, capping to ${SPA_OBSERVER_MAX_UNITS}`);
+      sendLog('warn', 'spa', 'SPA observer rescan capped', { found: newUnits.length, cap: SPA_OBSERVER_MAX_UNITS });
       newUnits = newUnits.slice(0, SPA_OBSERVER_MAX_UNITS);
     }
 
-    console.log(`[Shinkansen] SPA observer rescan #${spaObserverRescanCount}: ${newUnits.length} new units`);
+    sendLog('info', 'spa', `SPA observer rescan #${spaObserverRescanCount}`, { newUnits: newUnits.length });
     try {
       const { done, failures } = await translateUnits(newUnits);
       if (!STATE.translated) return; // 使用者可能在 rescan 期間按了還原
       if (done > 0) {
-        console.log(`[Shinkansen] SPA observer rescan #${spaObserverRescanCount}: translated ${done} units` +
-          (failures.length ? `, ${failures.length} failed` : ''));
+        sendLog('info', 'spa', `SPA observer rescan #${spaObserverRescanCount} done`, { done, failures: failures.length });
       }
     } catch (err) {
-      console.warn('[Shinkansen] SPA observer rescan failed', err);
+      sendLog('warn', 'spa', 'SPA observer rescan failed', { error: err.message });
     }
   }
 
@@ -2473,5 +2586,5 @@
   // 避免 SPA 同站內部導航時 chrome.tabs.onUpdated 沒觸發造成殘留。
   chrome.runtime.sendMessage({ type: 'CLEAR_BADGE' }).catch(() => {});
 
-  console.log('[Shinkansen] content script ready (v' + chrome.runtime.getManifest().version + ')');
+  sendLog('info', 'system', 'content script ready', { version: chrome.runtime.getManifest().version, url: location.href });
 })();

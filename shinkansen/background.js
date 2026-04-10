@@ -3,13 +3,13 @@
 
 import { translateBatch, extractGlossary } from './lib/gemini.js';
 import { getSettings } from './lib/storage.js';
-import { debugLog } from './lib/logger.js';
+import { debugLog, getLogs, clearLogs } from './lib/logger.js';
 import * as cache from './lib/cache.js';
 import { RateLimiter } from './lib/rate-limiter.js';
 import { getLimitsForSettings } from './lib/tier-limits.js';
 import * as usageDB from './lib/usage-db.js'; // v0.86: 用量紀錄 IndexedDB
 
-console.log('[Shinkansen] background service worker started');
+debugLog('info', 'system', 'service worker started', { version: chrome.runtime.getManifest().version });
 
 // ─── Rate Limiter(全域 singleton) ──────────────────────
 // 三維度 sliding window,同時約束 RPM / TPM / RPD。
@@ -20,7 +20,7 @@ async function initLimiter() {
   const settings = await getSettings();
   const limits = getLimitsForSettings(settings);
   limiter = new RateLimiter(limits);
-  debugLog('info', 'rate limiter initialized', {
+  debugLog('info', 'rate-limit', 'rate limiter initialized', {
     tier: settings.tier,
     model: settings.geminiConfig.model,
     rpm: limits.rpm,
@@ -40,7 +40,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
       const limits = getLimitsForSettings(settings);
       if (limiter) {
         limiter.updateLimits(limits);
-        debugLog('info', 'rate limiter limits updated', limits);
+        debugLog('info', 'rate-limit', 'rate limiter limits updated', limits);
       } else {
         limiter = new RateLimiter(limits);
       }
@@ -60,11 +60,13 @@ function estimateInputTokens(texts) {
   const currentVersion = chrome.runtime.getManifest().version;
   const result = await cache.checkVersionAndClear(currentVersion);
   if (result.cleared) {
-    console.log(
-      `[Shinkansen] cache cleared (v${result.oldVersion ?? '?'} → v${currentVersion}), removed ${result.removed} entries`
-    );
+    debugLog('info', 'cache', 'cache cleared on version change', {
+      oldVersion: result.oldVersion ?? '?',
+      newVersion: currentVersion,
+      removed: result.removed,
+    });
   } else {
-    console.log(`[Shinkansen] cache up-to-date (v${currentVersion})`);
+    debugLog('info', 'cache', 'cache up-to-date', { version: currentVersion });
   }
 })();
 
@@ -143,7 +145,7 @@ async function setTranslatedBadge(tabId) {
     }
     await chrome.action.setBadgeText({ text: BADGE_TEXT, tabId });
   } catch (err) {
-    debugLog('warn', 'setBadge failed', { error: err.message });
+    debugLog('warn', 'system', 'setBadge failed', { error: err.message });
   }
 }
 
@@ -152,7 +154,7 @@ async function clearTranslatedBadge(tabId) {
   try {
     await chrome.action.setBadgeText({ text: '', tabId });
   } catch (err) {
-    debugLog('warn', 'clearBadge failed', { error: err.message });
+    debugLog('warn', 'system', 'clearBadge failed', { error: err.message });
   }
 }
 
@@ -169,7 +171,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     handleTranslate(message.payload, sender)
       .then((result) => sendResponse({ ok: true, ...result }))
       .catch((err) => {
-        debugLog('error', 'translate failed', err);
+        debugLog('error', 'translate', 'translate failed', { error: err?.message || String(err) });
         sendResponse({ ok: false, error: err?.message || String(err) });
       });
     return true;
@@ -179,7 +181,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     handleExtractGlossary(message.payload, sender)
       .then((result) => sendResponse({ ok: true, ...result }))
       .catch((err) => {
-        debugLog('error', 'glossary extraction failed', err);
+        debugLog('error', 'glossary', 'glossary extraction failed', { error: err?.message || String(err) });
         sendResponse({ ok: false, error: err?.message || String(err) });
       });
     return true;
@@ -220,6 +222,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .catch((err) => sendResponse({ ok: false, error: err.message }));
     return true;
   }
+  // ─── v0.88: Log 系統訊息 ────────────────────────────────
+  // content.js 透過 sendLog() 送 LOG 訊息到 background，統一寫入記憶體 buffer
+  if (message?.type === 'LOG') {
+    const { level, category, message: msg, data } = message.payload || {};
+    // 補上來源分頁 URL
+    const enrichedData = { ...data, _tab: sender?.tab?.url || sender?.url };
+    debugLog(level || 'info', category || 'system', msg || '', enrichedData);
+    sendResponse({ ok: true });
+    return false; // 同步回應，不需 return true
+  }
+  if (message?.type === 'GET_LOGS') {
+    const afterSeq = message.payload?.afterSeq || 0;
+    sendResponse({ ok: true, ...getLogs(afterSeq) });
+    return false;
+  }
+  if (message?.type === 'CLEAR_RPD') {
+    (async () => {
+      try {
+        const all = await chrome.storage.local.get(null);
+        const rpdKeys = Object.keys(all).filter(k => k.startsWith('rateLimit_rpd_'));
+        if (rpdKeys.length) await chrome.storage.local.remove(rpdKeys);
+        if (limiter) {
+          limiter.rpdCount = 0;
+          limiter.rpdLoaded = false;
+          limiter.rpdLoadingPromise = null;
+        }
+        debugLog('info', 'rate-limit', 'RPD cleared via debug bridge', { removedKeys: rpdKeys });
+        sendResponse({ ok: true, removedKeys: rpdKeys });
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message });
+      }
+    })();
+    return true;
+  }
+  if (message?.type === 'CLEAR_LOGS') {
+    clearLogs();
+    sendResponse({ ok: true });
+    return false;
+  }
   // ─── v0.86: 用量紀錄相關訊息 ──────────────────────────
   if (message?.type === 'LOG_USAGE') {
     (async () => {
@@ -232,7 +273,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       await usageDB.logTranslation(record);
       sendResponse({ ok: true });
     })().catch((err) => {
-      console.warn('[Shinkansen] LOG_USAGE failed', err);
+      debugLog('warn', 'system', 'LOG_USAGE failed', { error: err.message });
       sendResponse({ ok: false, error: err.message });
     });
     return true;
@@ -300,7 +341,7 @@ async function handleTranslate(payload, sender) {
   });
 
   const cacheHits = texts.length - missingTexts.length;
-  debugLog('info', 'cache lookup', {
+  debugLog('info', 'cache', 'batch cache lookup', {
     total: texts.length,
     hits: cacheHits,
     misses: missingTexts.length,
@@ -313,31 +354,37 @@ async function handleTranslate(payload, sender) {
   // v0.48: hoist 到 if 外面，讓後面組 return usage 能讀到
   let billedInputTokens = 0;
   let billedCostUSD = 0;
+  let acquireResult = null; // v0.90: hoist 到 if 外面，讓 return 讀得到 rpdExceeded
   if (missingTexts.length) {
-    // 先過 rate limiter 取得一個 slot(會自動等待到 RPM/TPM/RPD 都有餘裕)
+    // 先過 rate limiter 取得一個 slot（RPM/TPM 硬限制；RPD 只回傳警告旗標）
     if (!limiter) await initLimiter();
     const estTokens = estimateInputTokens(missingTexts);
+    debugLog('info', 'rate-limit', 'acquire start', { estTokens, limiterExists: !!limiter });
     const tAcq0 = Date.now();
-    await limiter.acquire(estTokens, /* priority */ 1);
+    acquireResult = await limiter.acquire(estTokens, /* priority */ 1);
     const acquireMs = Date.now() - tAcq0;
     if (acquireMs > 50) {
-      console.log(`[Shinkansen] rate limiter waited ${acquireMs}ms (estTokens=${estTokens})`);
+      debugLog('info', 'rate-limit', 'rate limiter waited', { waitMs: acquireMs, estTokens });
     }
 
     const t0 = Date.now();
-    console.log(`[Shinkansen] handleTranslate: calling translateBatch with ${missingTexts.length} texts (${missingTexts.reduce((s, t) => s + (t?.length || 0), 0)} chars)`);
+    const totalChars = missingTexts.reduce((s, t) => s + (t?.length || 0), 0);
+    debugLog('info', 'api', 'translateBatch start', { texts: missingTexts.length, chars: totalChars });
     const res = await translateBatch(missingTexts, settings, glossary);
     fresh = res.translations;
     batchUsage = res.usage;
+    var batchHadMismatch = res.hadMismatch || false; // v0.94: mismatch 旗標
     batchCostUSD = computeCostUSD(batchUsage.inputTokens, batchUsage.outputTokens, settings.pricing);
     const batchMs = Date.now() - t0;
-    console.log(`[Shinkansen] handleTranslate: translateBatch done in ${batchMs}ms (${missingTexts.length} texts, input=${batchUsage.inputTokens} tok, output=${batchUsage.outputTokens} tok)`);
-    debugLog('info', 'gemini batch done', {
+    debugLog('info', 'api', 'translateBatch done', {
       count: missingTexts.length,
-      ms: batchMs,
-      tabId: sender?.tab?.id,
-      usage: batchUsage,
+      chars: totalChars,
+      elapsed: batchMs,
+      inputTokens: batchUsage.inputTokens,
+      outputTokens: batchUsage.outputTokens,
+      cachedTokens: batchUsage.cachedTokens || 0,
       costUSD: batchCostUSD,
+      tabUrl: sender?.tab?.url,
     });
     // 3. 寫回快取（帶 glossary suffix 確保有/無術語表分開存）
     await cache.setBatch(missingTexts, fresh, glossaryKeySuffix);
@@ -379,36 +426,38 @@ async function handleTranslate(payload, sender) {
       billedCostUSD,
       cacheHits,
     },
+    // v0.90: RPD 軟性預算警告（不阻擋翻譯，只通知 content 端顯示提示）
+    rpdExceeded: acquireResult?.rpdExceeded || false,
+    // v0.94: 本批翻譯是否觸發了 segment mismatch fallback
+    hadMismatch: typeof batchHadMismatch !== 'undefined' ? batchHadMismatch : false,
   };
 }
 
 // ─── v0.70: 術語表擷取處理（v0.69 建立，v0.70 加強除錯與容錯） ──
 async function handleExtractGlossary(payload, sender) {
-  console.log('[Shinkansen] handleExtractGlossary: start');
+  debugLog('info', 'glossary', 'glossary extraction start', { inputHash: payload.inputHash, chars: payload.compressedText?.length });
   const settings = await getSettings();
   if (!settings.apiKey) {
     throw new Error('尚未設定 Gemini API Key，請至設定頁填入。');
   }
   const { compressedText, inputHash } = payload;
-  console.log('[Shinkansen] handleExtractGlossary: inputHash=%s, chars=%d', inputHash, compressedText?.length);
 
   // 1. 先查術語表快取
   const cached = await cache.getGlossary(inputHash);
   if (cached) {
-    console.log('[Shinkansen] glossary cache hit: %d terms', cached.length);
-    debugLog('info', 'glossary cache hit', { inputHash, terms: cached.length });
+    debugLog('info', 'glossary', 'glossary cache hit', { inputHash, terms: cached.length });
     return { glossary: cached, usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 }, fromCache: true };
   }
 
   // 2. v0.70: 跳過 rate limiter — 術語表是 best-effort 單次請求，
   //    不走 limiter 避免被卡住（之前因 limiter 或 retry 導致 15 秒 timeout）。
   //    extractGlossary 內部已改用 AbortController 自帶 20 秒 fetch timeout。
-  console.log('[Shinkansen] glossary: calling Gemini (bypassing rate limiter)');
+  debugLog('info', 'glossary', 'calling Gemini (bypassing rate limiter)');
 
   // 3. 呼叫 Gemini 擷取術語表
   const result = await extractGlossary(compressedText, settings);
   const { glossary, usage, _diag } = result;
-  console.log('[Shinkansen] glossary: Gemini returned %d terms, usage=%o%s', glossary.length, usage, _diag ? `, diag: ${_diag}` : '');
+  debugLog('info', 'glossary', 'Gemini returned glossary', { terms: glossary.length, usage, diag: _diag || null });
 
   // 4. 寫入快取（只快取有內容的術語表；空結果不快取，讓下次重試有機會成功）
   if (glossary.length > 0) {
@@ -430,11 +479,10 @@ async function handleExtractGlossary(payload, sender) {
     await addUsage(billedInput, usage.outputTokens, billedCost);
   }
 
-  console.log('[Shinkansen] glossary extraction complete: %d terms, cached=%s', glossary.length, false);
-  debugLog('info', 'glossary extraction complete', {
+  debugLog('info', 'glossary', 'glossary extraction complete', {
     terms: glossary.length,
     inputHash,
-    tabId: sender?.tab?.id,
+    tabUrl: sender?.tab?.url,
   });
 
   return { glossary, usage, fromCache: false, _diag: _diag || null };
@@ -456,7 +504,7 @@ chrome.commands.onCommand.addListener(async (command) => {
 
 // ─── 安裝/更新事件 ─────────────────────────────────────────
 chrome.runtime.onInstalled.addListener(async ({ reason }) => {
-  console.log(`[Shinkansen] installed (${reason})`);
+  debugLog('info', 'system', `extension ${reason}`, { version: chrome.runtime.getManifest().version });
   // 安裝/更新時也檢查一次版本（雙重保險，SW 啟動時已經跑過一次）
   const currentVersion = chrome.runtime.getManifest().version;
   await cache.checkVersionAndClear(currentVersion);
@@ -472,12 +520,12 @@ chrome.runtime.onInstalled.addListener(async ({ reason }) => {
         const { apiKey: localKey } = await chrome.storage.local.get('apiKey');
         if (!localKey && syncKey) {
           await chrome.storage.local.set({ apiKey: syncKey });
-          console.log('[Shinkansen] apiKey migrated from sync → local');
+          debugLog('info', 'system', 'apiKey migrated from sync → local');
         }
         await chrome.storage.sync.remove('apiKey');
       }
     } catch (err) {
-      console.warn('[Shinkansen] apiKey migration failed', err);
+      debugLog('warn', 'system', 'apiKey migration failed', { error: err.message });
     }
   }
 });

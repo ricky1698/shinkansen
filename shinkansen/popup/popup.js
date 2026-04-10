@@ -102,14 +102,14 @@ async function init() {
   refreshShortcutHint();
 
   // v0.62 起：autoTranslate 仍走 sync（跨裝置同步），apiKey 改走 local（不同步）
-  const { autoTranslate = true } = await chrome.storage.sync.get(['autoTranslate']);
+  const { autoTranslate = false } = await chrome.storage.sync.get(['autoTranslate']);
   const { apiKey = '' } = await chrome.storage.local.get(['apiKey']);
   $('auto').checked = autoTranslate;
 
   // v0.73: 術語表一致化開關（讀 chrome.storage.sync 的 glossary.enabled）
   try {
     const { glossary: gc } = await chrome.storage.sync.get('glossary');
-    $('glossary-toggle').checked = gc?.enabled ?? true;
+    $('glossary-toggle').checked = gc?.enabled ?? false;
   } catch { /* 讀取失敗時維持預設 checked */ }
 
   if (!apiKey) {
