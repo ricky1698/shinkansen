@@ -18,6 +18,10 @@
 //   移除 isContentNav() 函式及其在 isInsideExcludedContainer() 中的呼叫。
 //   導覽區域的翻譯品味判斷交給 Gemini system prompt。
 //
+// v1.0.16 補充:
+//   獨立 <a> 的最短文字門檻從 12 提高至 20 字元，
+//   因此麵包屑短連結（如 "Computing"、"Laptops"）正確地不被偵測。
+//
 // 斷言基於 HTML5 語意元素（nav、footer、main），不綁站點，符合硬規則 8。
 // <!-- SANITY-PENDING: 將 'NAV' 加回 SEMANTIC_CONTAINER_EXCLUDE_TAGS，確認 nav 內段落消失 -->
 import { test, expect } from '../fixtures/extension.js';
@@ -47,9 +51,9 @@ test('nav-content: nav 內的文字應被偵測為翻譯單位', async ({
   const hasTrending = previews.some((p) => p.includes('Auto Show') || p.includes('EV roundup'));
   expect(hasTrending, '應偵測到 nav 內的 Trending 連結文字').toBe(true);
 
-  // 斷言 2: nav 麵包屑文字應被偵測到
+  // 斷言 2: nav 麵包屑短連結（< 20 字元）不應被偵測（v1.0.16 anchor 門檻）
   const hasBreadcrumb = previews.some((p) => p.includes('Computing') || p.includes('Laptops'));
-  expect(hasBreadcrumb, '應偵測到 nav 內的麵包屑文字').toBe(true);
+  expect(hasBreadcrumb, '麵包屑短連結不應被偵測（v1.0.16 anchor 門檻 20 字元）').toBe(false);
 
   // 斷言 3: role="navigation" 內的段落應被偵測到
   const hasRelated = previews.some((p) => p.includes('Related articles'));
