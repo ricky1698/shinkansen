@@ -131,6 +131,11 @@ async function load() {
   $('glossaryTemperature').value = gl.temperature;
   $('glossaryTimeout').value = gl.timeoutMs;
   $('glossaryPrompt').value = gl.prompt;
+
+  // v1.0.17: Toast 透明度
+  const opacityPct = Math.round((s.toastOpacity ?? 0.9) * 100);
+  $('toastOpacity').value = opacityPct;
+  $('toastOpacityLabel').textContent = opacityPct;
 }
 
 async function save() {
@@ -177,6 +182,8 @@ async function save() {
       timeoutMs: Number($('glossaryTimeout').value) || 60000,
       maxTerms: DEFAULTS.glossary.maxTerms,
     },
+    // v1.0.17: Toast 透明度
+    toastOpacity: Number($('toastOpacity').value) / 100,
   };
   await chrome.storage.sync.set(settings);
   $('save-status').textContent = '✓ 已儲存';
@@ -241,6 +248,9 @@ $('serviceTier').addEventListener('change', () => {
 });
 $('safetyMargin').addEventListener('input', () => {
   $('safetyMarginLabel').textContent = $('safetyMargin').value;
+});
+$('toastOpacity').addEventListener('input', () => {
+  $('toastOpacityLabel').textContent = $('toastOpacity').value;
 });
 
 $('reset-defaults').addEventListener('click', async () => {

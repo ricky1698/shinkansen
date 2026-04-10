@@ -16,6 +16,11 @@
     // element 被多個 fragment 單位改動時，只會快照一次「真正的原始 HTML」，
     // 不會被後續 fragment 的中途狀態污染。
     originalHTML: new Map(), // el → originalHTML
+    // v1.0.14: 儲存翻譯後的 innerHTML，用於偵測框架覆寫並重新套用。
+    // Engadget 等無限捲動網站的框架會在捲動時覆寫元素的 innerHTML 回原文，
+    // 但不移除元素本身（data-shinkansen-translated 屬性留存）。
+    // 有了這份快取就能在偵測到覆寫時立刻重新套用，不需重新呼叫 API。
+    translatedHTML: new Map(), // el → translatedHTML
   };
 
   // ─── v0.88: 統一 Log 系統（透過 message 送到 background buffer） ───
@@ -202,6 +207,20 @@
     </div>
   `;
   document.documentElement.appendChild(toastHost);
+
+  // v1.0.17: Toast 透明度——從設定讀取，並監聽即時變更
+  function applyToastOpacity(opacity) {
+    toastHost.style.opacity = Math.max(0.1, Math.min(1, opacity ?? 0.9));
+  }
+  chrome.storage.sync.get('toastOpacity').then(({ toastOpacity }) => {
+    applyToastOpacity(toastOpacity);
+  });
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'sync' && changes.toastOpacity) {
+      applyToastOpacity(changes.toastOpacity.newValue);
+    }
+  });
+
   const toastEl = shadow.getElementById('toast');
   const toastMsgEl = shadow.getElementById('msg');
   const toastDetailEl = shadow.getElementById('detail');
@@ -353,18 +372,32 @@
     'LI', 'BLOCKQUOTE', 'DD', 'DT',
     'FIGCAPTION', 'CAPTION', 'TH', 'TD',
     'SUMMARY',
+    'PRE',  // v1.0.8: 從 HARD_EXCLUDE_TAGS 移來，讓段落偵測能走進非程式碼的 <pre>
+    'FOOTER',  // v1.0.9: 內容 footer（main/article 內）需要被 walker 接受為翻譯單位；站底 footer 會被 isInsideExcludedContainer 排除
   ];
   // 直接排除 （純技術性元素）
-  const HARD_EXCLUDE_TAGS = new Set(['SCRIPT', 'STYLE', 'CODE', 'PRE', 'NOSCRIPT', 'TEXTAREA', 'INPUT', 'BUTTON', 'SELECT']);
-  // 標籤層級的容器排除：NAV / FOOTER 永遠跳過（HTML5 語意已表明是導覽/頁尾）
-  const SEMANTIC_CONTAINER_EXCLUDE_TAGS = new Set(['NAV', 'FOOTER']);
+  // v1.0.8: PRE 從硬排除移至條件排除——只有含 <code> 子元素的 <pre> 才視為
+  // 程式碼區塊跳過；不含 <code> 的 <pre>（如 Medium 留言區）視為普通容器。
+  const HARD_EXCLUDE_TAGS = new Set(['SCRIPT', 'STYLE', 'CODE', 'NOSCRIPT', 'TEXTAREA', 'INPUT', 'BUTTON', 'SELECT']);
+  // 標籤層級的容器排除：FOOTER 永遠跳過（HTML5 語意已表明是頁尾）
+  // v1.0.15: NAV 從硬排除移除——Engadget 等網站的 <nav> 裡含有使用者想看的
+  // 內容（趨勢文章標題、麵包屑等），「該不該翻」交給 system prompt 判斷。
+  const SEMANTIC_CONTAINER_EXCLUDE_TAGS = new Set(['FOOTER']);
   // 排除這些 ARIA role 的容器（全站頂部 banner、搜尋區、輔助側欄等）
-  const EXCLUDE_ROLES = new Set(['banner', 'navigation', 'contentinfo', 'search']);
+  // v1.0.15: 'navigation' 隨 NAV 一起移除
+  const EXCLUDE_ROLES = new Set(['banner', 'contentinfo', 'search']);
+  // v1.0.12: 豁免 isInteractiveWidgetContainer 檢查的標籤。
+  // 這些標籤的 HTML 語意決定了它們是內容容器，內部的 button 是次要控制項：
+  // - PRE: 預先格式化的文字（v1.0.8，Medium 留言的 "more" 按鈕）
+  // - H1-H6: 標題（v1.0.12，Substack 的 anchor link 複製按鈕）
+  const WIDGET_CHECK_EXEMPT_TAGS = new Set(['PRE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
 
   // 注意：這裡「刻意」不做任何以內容為主的 selector 排除（例如 .ambox 維護模板）。
   // 硬規則：「翻譯範圍由 system prompt 決定，不由 selector 決定」——content.js 只負責
-  // 「技術性必須跳過」的排除（script/style/code/表單控制項 + 語意容器 nav/footer/role），
+  // 「技術性必須跳過」的排除（script/style/code/表單控制項 + 語意容器 footer/role），
   // 「這段讀者該不該看」之類的內容判斷一律交給 Gemini system prompt。
+  // v1.0.15: NAV / role="navigation" 從硬排除移除——導覽區域內可能包含使用者想看
+  // 的內容（趨勢文章標題、麵包屑等），交給 system prompt 判斷。
   // 歷史：v0.30 之前曾用 `.ambox, .box-AI-generated, .box-More_footnotes_needed` 排除
   // Wikipedia 維護模板，v0.31 起移除，因為讀者確實需要看到這些警告的中文版。
 
@@ -431,21 +464,10 @@
     return true;
   }
 
-  // v0.40: 「nav 內容白名單」——某些 WordPress 外掛（例如 Jetpack 的相關貼文）
-  // 把「讀者要看的文章卡」裝在 <nav> 裡。語意上勉強說得通（nav = 導覽到其他
-  // 文章）但實質是正文外的延伸內容,應該翻譯。這類 nav 的 class 會帶有明確
-  // 的命名空間（jp-relatedposts-*)可以精準辨識。
-  //
-  // 這是 CLAUDE.md §6「結構性必須跳過」硬規則的「窄修例外」而不是方向轉變:
-  // 一般站內選單仍由 NAV 一律跳過的規則處理,只有命中白名單的 nav 才放行。
-  function isContentNav(el) {
-    if (!el || el.tagName !== 'NAV') return false;
-    const cls = el.className || '';
-    if (typeof cls !== 'string') return false;
-    // Jetpack Related Posts (Stratechery 等站使用)
-    if (/\bjp-relatedposts\b/.test(cls)) return true;
-    return false;
-  }
+  // v1.0.15: isContentNav() 已移除——NAV 從硬排除清單移除後不再需要白名單。
+  // 歷史：v0.40 新增 isContentNav() 處理 Jetpack Related Posts (<nav class="jp-relatedposts">)
+  // 等 WordPress 外掛把內容裝在 <nav> 裡的情況。v1.0.15 起 NAV 全面放行，
+  // 導覽選單的翻譯品味判斷改由 system prompt 處理。
 
   // v0.41: 「footer 內容白名單」——WordPress Block Theme 常把「延伸閱讀」類的
   // 文章卡片區塊塞進 <footer class="wp-block-template-part"> 裡（例如
@@ -456,10 +478,25 @@
   //
   // 這是 v0.40 nav 窄修的對稱延伸,同樣屬於 CLAUDE.md §6 的「窄修例外」而不
   // 是方向轉變——一般 footer 仍然整塊跳過,只有命中白名單條件的 footer 才放行。
+  //
+  // v1.0.9: 加入「主要內容區域內 footer」判斷——CSS-in-JS 網站（如 New Yorker）
+  // 把文章附屬資訊（刊登期數、出版日期等）放在 <main> 或 <article> 內的
+  // <footer> 裡，這是「內容 footer」而不是「站底 footer」。
+  // 結構判斷：footer 有 <article> 或 <main> 祖先 → 內容 footer，放行。
+  // 站底 footer 通常在 <body> 直屬或 wrapper div 內，不在 main/article 裡。
+  // 實測 New Yorker：內容 footer insideMain=true（textLen 98，1 link），
+  // 站底 footer insideMain=false（textLen 748，39 links，含 nav）。
   function isContentFooter(el) {
     if (!el || el.tagName !== 'FOOTER') return false;
-    // 只要 footer 子樹裡有 WP 文章 block,就當成內容 footer
-    return !!el.querySelector('.wp-block-query, .wp-block-post-title, .wp-block-post');
+    // 條件 1: footer 子樹裡有 WP 文章 block → 內容 footer（v0.41）
+    if (el.querySelector('.wp-block-query, .wp-block-post-title, .wp-block-post')) return true;
+    // 條件 2: footer 在 <article> 或 <main> 內 → 內容 footer（v1.0.9）
+    let cur = el.parentElement;
+    while (cur && cur !== document.body) {
+      if (cur.tagName === 'ARTICLE' || cur.tagName === 'MAIN') return true;
+      cur = cur.parentElement;
+    }
+    return false;
   }
 
   function isInsideExcludedContainer(el) {
@@ -469,11 +506,6 @@
     let cur = el;
     while (cur && cur !== document.body) {
       const tag = cur.tagName;
-      // v0.40: nav 內容白名單例外——命中白名單的 nav 不算排除容器
-      if (tag === 'NAV' && isContentNav(cur)) {
-        cur = cur.parentElement;
-        continue;
-      }
       // v0.41: footer 內容白名單例外——含 WP 文章 block 的 footer 放行
       if (tag === 'FOOTER' && isContentFooter(cur)) {
         cur = cur.parentElement;
@@ -484,6 +516,11 @@
       if (role && EXCLUDE_ROLES.has(role)) return true;
       // HEADER 只在明確標示 banner role 時排除（保留文章標題的 header)
       if (tag === 'HEADER' && role === 'banner') return true;
+      // v1.0.9: contenteditable / role=textbox 是表單控制項，等同 <textarea>，
+      // 不該翻譯。Medium 留言輸入框用 <div role="textbox" contenteditable="true">
+      // 包住 placeholder 文字，翻譯會破壞表單互動。
+      if (cur.getAttribute && cur.getAttribute('contenteditable') === 'true') return true;
+      if (role === 'textbox') return true;
       cur = cur.parentElement;
     }
     return false;
@@ -559,7 +596,7 @@
   // 是否含有其他 block tag 子孫（若是，代表這個元素不是「葉子 block」,
   // 應該跳過自己讓 walker 下降到子節點處理，避免父層 textContent 把子層
   // 的圖片/連結等子元素一併清掉）
-  const BLOCK_TAGS_SET = new Set(['P','H1','H2','H3','H4','H5','H6','LI','BLOCKQUOTE','DD','DT','FIGCAPTION','CAPTION','TH','TD','SUMMARY']);
+  const BLOCK_TAGS_SET = new Set(['P','H1','H2','H3','H4','H5','H6','LI','BLOCKQUOTE','DD','DT','FIGCAPTION','CAPTION','TH','TD','SUMMARY','PRE','FOOTER']);
   function containsBlockDescendant(el) {
     const all = el.getElementsByTagName('*');
     for (let i = 0; i < all.length; i++) {
@@ -778,6 +815,8 @@
           // Wikipedia infobox TH 裡內嵌的 .mw-parser-output {...} CSS
           // 會被當成純文字送進 LLM。
           if (HARD_EXCLUDE_TAGS.has(child.tagName)) continue;
+          // v1.0.8: <pre> 含 <code> → 程式碼區塊，序列化時也跳過
+          if (child.tagName === 'PRE' && child.querySelector('code')) continue;
           // v0.50: <br> 在 MJML / Mailjet / Mailchimp 等 HTML email 模板裡
           // 是「段落分隔符」（範本沒有 <p>，多段內容用 <br><br><br> 分隔）。
           // 序列化時把 <br> 還原成 \n，連續多個 <br> 就會變成 \n\n…，
@@ -1153,6 +1192,11 @@
           if (stats) stats.hardExcludeTag = (stats.hardExcludeTag || 0) + 1;
           return NodeFilter.FILTER_REJECT;
         }
+        // v1.0.8: <pre> 含 <code> 子元素 → 程式碼區塊，跳過整棵子樹
+        if (el.tagName === 'PRE' && el.querySelector('code')) {
+          if (stats) stats.hardExcludeTag = (stats.hardExcludeTag || 0) + 1;
+          return NodeFilter.FILTER_REJECT;
+        }
         if (el.hasAttribute('data-shinkansen-translated')) {
           if (stats) stats.alreadyTranslated = (stats.alreadyTranslated || 0) + 1;
           return NodeFilter.FILTER_REJECT;
@@ -1168,7 +1212,12 @@
         // v0.39: 含 button / role=button 的 block 是互動 widget 容器（例如
         // X 的 Who-to-follow UserCell <li>）,整塊不翻譯以免 serializer slot
         // 爆炸壓扁結構。見 isInteractiveWidgetContainer 註解。
-        if (isInteractiveWidgetContainer(el)) {
+        // v1.0.8: PRE 豁免此檢查——PRE 的 HTML 語意是「預先格式化的文字容器」，
+        // 不會作為互動 widget 卡片使用。PRE 內部的 button（如 Medium 留言的
+        // 「more」展開按鈕）是次要控制項，不是 CTA，不該讓整段被跳過。
+        // v1.0.12: heading（H1-H6）也豁免——heading 的語意就是標題，內部的 button
+        // 是輔助控制項（如 Substack 的 anchor link 複製按鈕），不是 widget CTA。
+        if (!WIDGET_CHECK_EXEMPT_TAGS.has(el.tagName) && isInteractiveWidgetContainer(el)) {
           if (stats) stats.interactiveWidget = (stats.interactiveWidget || 0) + 1;
           return NodeFilter.FILTER_REJECT;
         }
@@ -1258,12 +1307,53 @@
       if (isInteractiveWidgetContainer(a)) return;
       if (!isVisible(a)) return;
       if (!isCandidateText(a)) return;
-      // 條件 3:文字夠長,擋掉 nav 類短連結
+      // 條件 3:文字夠長,擋掉 nav 類短連結（含較長 label 如 "Buyer's Guide"、"Entertainment"）
       const txt = (a.innerText || '').trim();
-      if (txt.length < 12) return;
+      if (txt.length < 20) return;
       if (stats) stats.leafContentAnchor = (stats.leafContentAnchor || 0) + 1;
       results.push({ kind: 'element', el: a });
       seen.add(a);
+    });
+
+    // v1.0.8: 「leaf content element」補抓 —— CSS-in-JS 框架（Styled Components、
+    // Emotion 等）常以 <div class="BaseText-xxx"> 或 <span class="BaseText-xxx">
+    // 取代語意化的 <p>，造成 walker 一個 BLOCK_TAG 都收不到。
+    // New Yorker 文章副標（deck, DIV）與圖說（caption, SPAN）就是典型案例。
+    //
+    // 結構通則（五個條件同時成立）:
+    //   1. 是 DIV 或 SPAN（最常被 CSS-in-JS 用來取代語意 tag 的兩種元素）
+    //   2. 祖先中沒有任何 BLOCK_TAG（有的話代表父 block 會負責處理）
+    //   3. **沒有任何子元素**（純文字 leaf）—— 有子元素的容器在
+    //      clean-slate 注入時會破壞內部 inline 排版結構，不可碰
+    //   4. innerText 經 trim 後 >= 20 字（擋掉 label、button 文字等短元素）
+    //   5. 通過 isVisible / isCandidateText / 排除容器 / widget 容器 / 已翻過
+    //
+    // 這樣 CaptionWrapper（DIV, 有 SPAN 子元素）不會被抓，但裡面的每個
+    // SPAN（純文字 leaf）會被各自獨立翻譯，保留 inline 排版結構。
+    document.querySelectorAll('div, span').forEach(d => {
+      if (seen.has(d)) return;
+      if (d.hasAttribute('data-shinkansen-translated')) return;
+      // 條件 3: 純文字 leaf — 不含任何子元素
+      if (d.children.length > 0) return;
+      // 條件 2: 祖先無 BLOCK_TAG
+      let cur = d.parentElement;
+      let hasBlockAncestor = false;
+      while (cur && cur !== document.body) {
+        if (BLOCK_TAGS_SET.has(cur.tagName)) { hasBlockAncestor = true; break; }
+        cur = cur.parentElement;
+      }
+      if (hasBlockAncestor) return;
+      // 結構性排除
+      if (isInsideExcludedContainer(d)) return;
+      if (isInteractiveWidgetContainer(d)) return;
+      if (!isVisible(d)) return;
+      if (!isCandidateText(d)) return;
+      // 條件 4: 文字夠長
+      const txt = (d.innerText || '').trim();
+      if (txt.length < 20) return;
+      if (stats) stats.leafContentDiv = (stats.leafContentDiv || 0) + 1;
+      results.push({ kind: 'element', el: d });
+      seen.add(d);
     });
 
     return results;
@@ -1285,8 +1375,8 @@
   // v0.82: SPA 動態載入支援常數
   // MutationObserver 在翻譯完成後啟動，偵測 SPA 動態新增的段落。
   // 嚴格限制次數與去抖動間隔，避免 infinite scroll 造成 API 成本爆炸。
-  const SPA_OBSERVER_DEBOUNCE_MS = 3000;   // DOM 變化後等 3 秒再 rescan
-  const SPA_OBSERVER_MAX_RESCANS = 5;      // 單次翻譯後最多追加掃描 5 次
+  const SPA_OBSERVER_DEBOUNCE_MS = 1000;   // DOM 變化後等 1 秒再 rescan（v1.0.14: 從 3s 降為 1s，改善無限捲動網站的回應速度）
+  const SPA_OBSERVER_MAX_RESCANS = Infinity; // v1.0.14: 不限制 rescan 次數（每次已有 MAX_UNITS 上限保護）
   const SPA_OBSERVER_MAX_UNITS = 50;       // 每次追加掃描最多翻譯 50 段
   const SPA_NAV_SETTLE_MS = 800;           // SPA 導航後等 DOM 穩定的毫秒數
 
@@ -1986,6 +2076,7 @@
         // 節點清空。這樣 fragment 會落在 MJML inner wrapper 底下，自動繼承 16px。
         replaceNodeInPlace(el, frag);
         el.setAttribute('data-shinkansen-translated', '1');
+        STATE.translatedHTML.set(el, el.innerHTML); // v1.0.14: 快取譯文供內容守衛用
         return;
       }
       // fallback：把譯文中的佔位符標記去掉,走 plain-text 替換。
@@ -1994,11 +2085,13 @@
       const cleaned = stripStrayPlaceholderMarkers(translation);
       plainTextFallback(el, cleaned);
       el.setAttribute('data-shinkansen-translated', '1');
+      STATE.translatedHTML.set(el, el.innerHTML); // v1.0.14: 快取譯文供內容守衛用
       return;
     }
 
     replaceTextInPlace(el, translation);
     el.setAttribute('data-shinkansen-translated', '1');
+    STATE.translatedHTML.set(el, el.innerHTML); // v1.0.14: 快取譯文供內容守衛用
   }
 
   /**
@@ -2018,7 +2111,8 @@
    * 最長文字節點」目標，取代原本的 containsMedia() 分支邏輯。
    *
    * 需過濾的技術節點（歷史教訓 v0.33 / v0.34）:
-   *   (1) <script>/<style>/<noscript>/<code>/<pre> 底下的文字節點
+   *   (1) <script>/<style>/<noscript>/<code> 底下的文字節點
+   *       （<pre> 自 v1.0.8 起僅在含 <code> 時排除，不含 <code> 的視為普通容器）
    *   (2) CSS display:none / visibility:hidden 的隱形祖先底下的文字節點
    * Wikipedia 的 #coordinates 同時含 .geo-dms（可見）與 .geo-nondefault > .geo-dec
    * （display:none），過濾掉隱形祖先才能確保譯文塞進看得到的節點。
@@ -2030,6 +2124,8 @@
         let p = node.parentElement;
         while (p && p !== el) {
           if (HARD_EXCLUDE_TAGS.has(p.tagName)) return NodeFilter.FILTER_REJECT;
+          // v1.0.8: <pre> 含 <code> → 程式碼區塊，文字節點也排除
+          if (p.tagName === 'PRE' && p.querySelector('code')) return NodeFilter.FILTER_REJECT;
           const cs = p.ownerDocument?.defaultView?.getComputedStyle?.(p);
           if (cs && (cs.display === 'none' || cs.visibility === 'hidden')) {
             return NodeFilter.FILTER_REJECT;
@@ -2313,6 +2409,7 @@
       el.removeAttribute('data-shinkansen-translated');
     });
     STATE.originalHTML.clear();
+    STATE.translatedHTML.clear(); // v1.0.14
     STATE.translated = false;
     // 通知 background 清掉 extension icon 的紅點
     chrome.runtime.sendMessage({ type: 'CLEAR_BADGE' }).catch(() => {});
@@ -2347,6 +2444,8 @@
   let spaObserver = null;          // MutationObserver instance
   let spaObserverDebounceTimer = null;
   let spaObserverRescanCount = 0;  // 累計追加掃描次數
+  let contentGuardInterval = null;  // v1.0.20: 週期性守衛掃描 interval
+  const GUARD_SWEEP_INTERVAL_MS = 1000; // v1.0.20: 週期性掃描間隔（1 秒）
 
   /**
    * 重置翻譯狀態，供 SPA 導航時呼叫。
@@ -2366,6 +2465,7 @@
     stopSpaObserver();
     // 清理翻譯狀態（不碰 DOM，SPA 框架自己會換 DOM）
     STATE.originalHTML.clear();
+    STATE.translatedHTML.clear(); // v1.0.14
     STATE.cache.clear();
     STATE.translated = false;
     STATE._glossaryPromise = null;
@@ -2422,6 +2522,10 @@
   // 不會影響頁面的 main world。但 content script 與 main world 共享同一個
   // History 物件（MDN: "content scripts share the same DOM"），所以 main world
   // 的 pushState 呼叫也會走到 patch 過的版本。
+  //
+  // 已知限制（v1.0.10 補充）：如果 SPA 框架在 module 初始化時就快取了
+  // history.pushState 的原始參照（例如 React Router），content script
+  // 在 document_idle 才 patch 的版本不會被呼叫到。下方的 URL 輪詢是 safety net。
   const _origPushState = history.pushState.bind(history);
   const _origReplaceState = history.replaceState.bind(history);
 
@@ -2431,9 +2535,37 @@
   };
   history.replaceState = function (...args) {
     _origReplaceState(...args);
-    handleSpaNavigation();
+    // v1.0.13: replaceState 只靜默同步 spaLastUrl，不觸發導航重設。
+    // 原因：無限捲動網站（如 Engadget）在捲動時用 replaceState 更新網址列
+    // 來反映目前可見的文章，這不是真正的頁面導航。若觸發 handleSpaNavigation
+    // 會清掉所有翻譯狀態，導致使用者捲動時看到譯文消失。
+    // 真正的 SPA 導航走 pushState 或 popstate，不受影響。
+    spaLastUrl = location.href;
   };
   window.addEventListener('popstate', () => handleSpaNavigation());
+
+  // ─── v1.0.10: URL 輪詢（SPA 導航 safety net） ─────────────
+  // monkey-patch history API 有盲區：部分 SPA 框架（React Router 等）在
+  // module 初始化時就快取 history.pushState 的原始參照，content script
+  // 的 patch 攔不到。加一個低頻 URL 輪詢作為 safety net。
+  // 每 500ms 比對 location.href，偵測到變化就呼叫 handleSpaNavigation。
+  // 成本極低（一次字串比較），但能 cover 所有 SPA 路由實作。
+  const SPA_URL_POLL_MS = 500;
+  setInterval(() => {
+    if (location.href !== spaLastUrl) {
+      // v1.0.13: 若已翻譯且 DOM 中仍有翻譯節點,視為捲動型 URL 更新
+      // (如 Engadget 無限捲動用 replaceState 反映目前可見文章)。
+      // 只靜默同步 spaLastUrl,不重設翻譯狀態。
+      // 真正的 SPA 導航 (pushState) 在 500ms 輪詢偵測到時,
+      // 框架已完成 re-render,原翻譯節點會被新 DOM 取代,不會命中此分支。
+      if (STATE.translated && document.querySelector('[data-shinkansen-translated]')) {
+        sendLog('info', 'spa', 'URL changed while translated content present — scroll-based update, skipping reset', { newUrl: location.href, oldUrl: spaLastUrl });
+        spaLastUrl = location.href;
+        return;
+      }
+      handleSpaNavigation();
+    }
+  }, SPA_URL_POLL_MS);
 
   // ─── 翻譯後 MutationObserver（動態新增段落偵測） ────────
   // 只在翻譯完成後啟動，偵測 SPA 頁面內動態載入的新段落（例如
@@ -2448,6 +2580,11 @@
       childList: true,
       subtree: true,
     });
+    // v1.0.20: 啟動週期性 Content Guard 掃描（每秒一次）。
+    // 不依賴 MutationObserver 觸發 = 不可能產生迴圈，也不需要 cooldown。
+    if (!contentGuardInterval) {
+      contentGuardInterval = setInterval(runContentGuard, GUARD_SWEEP_INTERVAL_MS);
+    }
     sendLog('info', 'spa', 'SPA observer started');
   }
 
@@ -2456,6 +2593,10 @@
       clearTimeout(spaObserverDebounceTimer);
       spaObserverDebounceTimer = null;
     }
+    if (contentGuardInterval) {
+      clearInterval(contentGuardInterval);
+      contentGuardInterval = null;
+    }
     if (spaObserver) {
       spaObserver.disconnect();
       spaObserver = null;
@@ -2463,22 +2604,56 @@
     spaObserverRescanCount = 0;
   }
 
-  function onSpaObserverMutations(mutations) {
-    // 若已還原原文或不再處於翻譯完成狀態，停止觀察
-    if (!STATE.translated) {
-      stopSpaObserver();
-      return;
+  // ─── v1.0.14→v1.0.20: 內容守衛（Content Guard） ──────────
+  // 框架（React / 虛擬捲動等）會在捲動時覆寫元素的 innerHTML 回原文，
+  // 但不移除元素本身（data-shinkansen-translated 屬性留存）。
+  // 內容守衛從 STATE.translatedHTML 快取重新套用譯文，不需重新呼叫 API。
+  //
+  // v1.0.20 簡化：拿掉 mutation 觸發的路徑與 cooldown 機制，
+  // 改為每秒週期性掃描。不依賴 MutationObserver 觸發 = 不可能產生迴圈，
+  // 也不需要 cooldown 來壓制迴圈。靜默運作，不跳 toast。
+  function runContentGuard() {
+    if (!STATE.translated) return;
+
+    let restored = 0;
+    for (const [el, savedHTML] of STATE.translatedHTML) {
+      // 元素暫時不在 DOM 時只跳過，不刪除快取。
+      // Facebook 虛擬捲動會暫時斷開元素再重新接回（帶原文），
+      // 若在斷開時刪除快取，接回時就無法還原譯文。
+      if (!el.isConnected) continue;
+      if (el.innerHTML === savedHTML) continue;
+      // 只修復可見 / 即將可見的元素（視窗上下各 500px 緩衝）。
+      // 離螢幕的元素不要動——React / 虛擬捲動會立刻覆寫回去，
+      // 造成每秒數百次無意義 DOM 寫入、干擾新內容偵測。
+      // 當使用者捲到那些元素時，它們進入緩衝區就會被修復。
+      const rect = el.getBoundingClientRect();
+      if (rect.bottom < -500 || rect.top > window.innerHeight + 500) continue;
+      el.innerHTML = savedHTML;
+      restored++;
     }
-    // 過濾：只關心有實質新增節點的 mutation
+    if (restored > 0) {
+      sendLog('info', 'guard', `Content guard restored ${restored} overwritten nodes`);
+    }
+  }
+
+  function onSpaObserverMutations(mutations) {
+    if (!STATE.translated) { stopSpaObserver(); return; }
+
+    // ── 新內容偵測（rescan） ──
+    // 偵測框架動態載入的新段落（SPA lazy-load、infinite scroll 等）。
+    // 過濾掉「已翻譯元素內部」的 mutations——那是 Content Guard 或翻譯注入
+    // 的 DOM 寫入副作用，不是框架載入的新內容。
+    if (spaObserverRescanCount >= SPA_OBSERVER_MAX_RESCANS) return;
+
     const hasNewContent = mutations.some(m =>
       m.type === 'childList' && m.addedNodes.length > 0 &&
+      !(m.target.nodeType === 1 && m.target.closest?.('[data-shinkansen-translated]')) &&
       Array.from(m.addedNodes).some(n =>
         n.nodeType === Node.ELEMENT_NODE && n.textContent.trim().length > 10
       )
     );
     if (!hasNewContent) return;
 
-    // 去抖動：每次 DOM 變動重置計時器，等穩定 SPA_OBSERVER_DEBOUNCE_MS 後才 rescan
     if (spaObserverDebounceTimer) clearTimeout(spaObserverDebounceTimer);
     spaObserverDebounceTimer = setTimeout(spaObserverRescan, SPA_OBSERVER_DEBOUNCE_MS);
   }
@@ -2487,8 +2662,9 @@
     spaObserverDebounceTimer = null;
     if (!STATE.translated) return;
     if (spaObserverRescanCount >= SPA_OBSERVER_MAX_RESCANS) {
-      sendLog('info', 'spa', 'SPA observer: reached max rescans, stopping', { maxRescans: SPA_OBSERVER_MAX_RESCANS });
-      stopSpaObserver();
+      // v1.0.14: 到上限後不再翻譯新段落，但不關閉 observer——
+      // 內容守衛仍需要 observer 偵測框架覆寫已翻譯節點。
+      sendLog('info', 'spa', 'SPA observer: reached max rescans, stopping NEW translations only', { maxRescans: SPA_OBSERVER_MAX_RESCANS });
       return;
     }
     spaObserverRescanCount++;
@@ -2503,14 +2679,27 @@
     }
 
     sendLog('info', 'spa', `SPA observer rescan #${spaObserverRescanCount}`, { newUnits: newUnits.length });
+    // v1.0.14: 翻譯新段落時顯示 Toast 進度
+    showToast('loading', `翻譯新內容… 0 / ${newUnits.length}`, { progress: 0, startTimer: true });
     try {
-      const { done, failures } = await translateUnits(newUnits);
+      const { done, failures } = await translateUnits(newUnits, {
+        onProgress: (d, t) => showToast('loading', `翻譯新內容… ${d} / ${t}`, {
+          progress: d / t,
+        }),
+      });
       if (!STATE.translated) return; // 使用者可能在 rescan 期間按了還原
       if (done > 0) {
         sendLog('info', 'spa', `SPA observer rescan #${spaObserverRescanCount} done`, { done, failures: failures.length });
+        const failedCount = failures.length;
+        if (failedCount > 0) {
+          showToast('error', `新內容翻譯部分失敗:${failedCount} / ${newUnits.length} 段`, { stopTimer: true });
+        } else {
+          showToast('success', `已翻譯 ${done} 段新內容`, { progress: 1, stopTimer: true, autoHideMs: 2000 });
+        }
       }
     } catch (err) {
       sendLog('warn', 'spa', 'SPA observer rescan failed', { error: err.message });
+      showToast('error', `新內容翻譯失敗:${err.message}`, { stopTimer: true });
     }
   }
 

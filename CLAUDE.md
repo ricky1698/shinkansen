@@ -115,7 +115,8 @@
 
 ### 6. 翻譯範圍由 system prompt 決定，不由 selector 決定
 
-- **`content.js` 只負責「技術性必須跳過」的排除**：`<script>` / `<style>` / `<code>` / `<pre>` / `<noscript>` / 表單控制項（`input` / `button` / `select` / `textarea`），以及 HTML5 語意容器 `<nav>` / `<footer>` 和 ARIA role `banner` / `navigation` / `search` / `contentinfo`。這些是「結構上本來就不該翻」的東西。
+- **`content.js` 只負責「技術性必須跳過」的排除**：`<script>` / `<style>` / `<code>` / `<pre>` / `<noscript>` / 表單控制項（`input` / `button` / `select` / `textarea`），以及 HTML5 語意容器 `<footer>` 和 ARIA role `banner` / `search` / `contentinfo`。這些是「結構上本來就不該翻」的東西。
+- **`<nav>` / `role="navigation"` 不再硬排除**（v1.0.15 起）：導覽區域內可能包含使用者想看的內容（趨勢文章標題、麵包屑、相關文章推薦等），「該不該翻」交給 system prompt 判斷。歷史：v0.40 曾用 `isContentNav()` 白名單機制放行特定 nav（Jetpack Related Posts），v1.0.15 直接移除 NAV 硬排除，白名單不再需要。
 - **「這段讀者該不該看」之類的內容品味判斷一律交給 Gemini `systemInstruction`**，不要在 `content.js` / `lib/` 加 class 或 selector 層級的內容排除（例如不要再加 `.ambox`、`.box-*`、`.editnotice` 之類的黑名單）。
 - **原因**：selector 與 prompt 兩條路徑若同時定義「該不該翻」，容易互相衝突，且 selector 一刀切會造成誤傷（例如 Wikipedia 的維護警告框其實是讀者需要看到的內容）。統一由 prompt 控制才能依語意判斷。
 - **歷史**：v0.29–v0.30 曾用 `EXCLUDE_BY_SELECTOR = '.ambox, .box-AI-generated, .box-More_footnotes_needed'` 排除 Wikipedia 維護模板，v0.31 起移除，改由 system prompt 決定。
