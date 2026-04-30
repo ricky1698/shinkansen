@@ -813,6 +813,7 @@
   //   - progressive 模式:後寫覆蓋前寫(同 startMs 用 dedup map)
 
   const _OVERLAY_TAG = 'shinkansen-yt-overlay';
+  const _PAGE_PANEL_ID = 'shinkansen-yt-page-subtitles';
 
   function _getPlayerRoot() {
     return document.querySelector('#movie_player')
@@ -877,9 +878,9 @@
             box-sizing: border-box;
           }
           .src {
-            font-size: calc(var(--sk-cue-size, 18px) * 0.78);
-            opacity: 0.75;
-          }
+             font-size: calc(var(--sk-cue-size, 18px) * 0.78);
+             opacity: 0.75;
+           }
           .tgt {
             font-size: var(--sk-cue-size, 18px);
           }
@@ -892,6 +893,111 @@
       `;
     }
     return host;
+  }
+
+  function _getPageSubtitleMount() {
+    const below = document.querySelector('#below');
+    if (below) return { container: below, prepend: true };
+
+    const primaryInner = document.querySelector('#primary-inner') || document.querySelector('#primary');
+    if (!primaryInner) return null;
+    const children = Array.from(primaryInner.children || []);
+    const before = children.find((el) => el.matches?.('ytd-watch-metadata')) || null;
+    const after = children.find((el) => el.matches?.('#full-bleed-container, #player-container-outer, #player-container, #movie_player')) || null;
+    return { container: primaryInner, before, after };
+  }
+
+  function _ensurePageSubtitlePanel() {
+    const mount = _getPageSubtitleMount();
+    if (!mount?.container) return null;
+
+    let host = document.getElementById(_PAGE_PANEL_ID);
+    if (!host) {
+      host = document.createElement('div');
+      host.id = _PAGE_PANEL_ID;
+      Object.assign(host.style, {
+        display: 'none',
+        margin: '12px 0 16px',
+        padding: '12px 16px',
+        borderRadius: '12px',
+        background: 'rgba(15, 15, 15, 0.92)',
+        color: '#fff',
+        boxSizing: 'border-box',
+        lineHeight: '1.55',
+        fontFamily: '"YouTube Noto", Roboto, Arial, Helvetica, sans-serif',
+        width: '100%',
+        textAlign: 'center',
+        position: 'relative',
+        zIndex: '1',
+      });
+      host.innerHTML = `
+        <div class="sk-yt-page-src" style="font-size:14px;opacity:.78;margin-bottom:6px;white-space:pre-wrap;"></div>
+        <div class="sk-yt-page-tgt" style="font-size:18px;font-weight:600;white-space:pre-wrap;"></div>
+      `;
+    }
+
+    if (mount.prepend) {
+      if (host.parentElement !== mount.container || mount.container.firstElementChild !== host) {
+        mount.container.insertBefore(host, mount.container.firstChild);
+      }
+    } else if (mount.before && (host.parentElement !== mount.container || host.nextSibling !== mount.before)) {
+      mount.container.insertBefore(host, mount.before);
+    } else if (!host.isConnected) {
+      if (mount.after?.parentElement === mount.container && mount.after.nextSibling) {
+        mount.container.insertBefore(host, mount.after.nextSibling);
+      } else if (mount.after?.parentElement === mount.container) {
+        mount.container.appendChild(host);
+      } else {
+        mount.container.appendChild(host);
+      }
+    }
+
+    return host;
+  }
+
+  function _removePageSubtitlePanel() {
+    document.getElementById(_PAGE_PANEL_ID)?.remove();
+  }
+
+  function _shouldUsePageSubtitlePanel() {
+    return !!(
+      SK.isYouTubePage?.()
+      && SK.YT.config?.bilingualMode === true
+      && !document.fullscreenElement
+      && _getPageSubtitleMount()
+    );
+  }
+
+  function _setPageSubtitleContent(targetText, sourceText) {
+    const host = _ensurePageSubtitlePanel();
+    if (!host) return false;
+    const srcEl = host.querySelector('.sk-yt-page-src');
+    const tgtEl = host.querySelector('.sk-yt-page-tgt');
+    const target = String(targetText || '').trim();
+    const source = String(sourceText || '').trim();
+    if (!target) {
+      if (srcEl) srcEl.textContent = '';
+      if (tgtEl) tgtEl.textContent = '';
+      host.style.display = 'none';
+      return true;
+    }
+    if (srcEl) {
+      srcEl.textContent = source;
+      srcEl.style.display = source ? 'block' : 'none';
+    }
+    if (tgtEl) tgtEl.textContent = target;
+    host.style.display = 'block';
+    return true;
+  }
+
+  SK._setPageSubtitleContentForTest = _setPageSubtitleContent;
+  SK._ensurePageSubtitlePanelForTest = _ensurePageSubtitlePanel;
+
+  function _syncSubtitlePresentationMode() {
+    const usePagePanel = _shouldUsePageSubtitlePanel();
+    _setAsrHidingMode(SK.YT.active && (SK.YT.isAsr === true || usePagePanel));
+    if (!usePagePanel) _setPageSubtitleContent('', '');
+    return usePagePanel;
   }
 
   // 譯文過長時依標點拆行(LLM 自由分句可能合很長,例如 50+ 字一句)
@@ -979,19 +1085,35 @@
     const tgtEl = host.shadowRoot.querySelector('.tgt');
     const srcEl = host.shadowRoot.querySelector('.src');
     if (!targetText) {
+      if (srcEl) {
+        if (srcEl.innerHTML !== '') srcEl.innerHTML = '';
+        srcEl.hidden = true;
+      }
       if (tgtEl.innerHTML !== '') tgtEl.innerHTML = '';
       host.style.display = 'none';
       return;
     }
+    const isBilingual = SK.YT.config?.bilingualMode === true;
     const wrapped = _wrapTargetText(targetText);
     // 用 innerHTML + <br> 寫入(比 textContent + \n + white-space:pre-wrap 更穩定,
     // 不受 inline-block 的 wrap 行為差異影響)。先 escape HTML 字元防注入。
     const html = _escapeHtml(wrapped).replace(/\n/g, '<br>');
     if (tgtEl.innerHTML !== html) tgtEl.innerHTML = html;
-    // source 暫不顯示(避免跟原生 ASR caption 三層字幕重疊;之後可加 toggle)
-    if (sourceText !== undefined && srcEl) srcEl.hidden = true;
+    if (srcEl) {
+      const source = String(sourceText || '').trim();
+      if (isBilingual && source) {
+        const srcHtml = _escapeHtml(source).replace(/\n/g, '<br>');
+        if (srcEl.innerHTML !== srcHtml) srcEl.innerHTML = srcHtml;
+        srcEl.hidden = false;
+      } else {
+        if (srcEl.innerHTML !== '') srcEl.innerHTML = '';
+        srcEl.hidden = true;
+      }
+    }
     host.style.display = 'block';
   }
+
+  SK._setOverlayContentForTest = _setOverlayContent;
 
   // 暴露給 spec 用
   SK._wrapTargetTextForOverlay = _wrapTargetText;
@@ -1002,15 +1124,15 @@
     root.querySelectorAll(_OVERLAY_TAG).forEach(el => el.remove());
   }
 
-  // 控制原生 YouTube 字幕的隱藏(ASR 模式專用)。
+  // 控制原生 YouTube 字幕的隱藏。
+  // ASR overlay 與 watch page 的 page panel 都需要把 video 上的原生字幕隱藏，
   // 由 player root 的 class 控制,讓 stop / SPA 移除 class 即可恢復原生顯示。
   // 用 class + 全域 style 而非 inline style:避免每個 caption-window 個別處理 mutation 競爭。
   const _ASR_PLAYER_CLASS = 'shinkansen-asr-active';
   const _ASR_HIDE_CSS_ID  = 'shinkansen-asr-hide-css';
-  // v1.8.16:stylesheet 注入從 _setAsrHidingMode 抽出獨立 helper,
-  // bilingual=true 也走「不隱藏原生 CC + overlay 上抬 90px」的 CSS rule(host[bilingual]),
-  // 這條 rule 必須跟 .ytp-autohide 規則同份 stylesheet 一起注入,reload 後直接進雙語
-  // (從沒走過 active=true 分支)否則拿不到 90px 上抬,中英 CC 重疊在原生 30px 高度。
+  // v1.8.16:stylesheet 注入從 _setAsrHidingMode 抽出獨立 helper。
+  // v1.8.25:雙語 ASR 改成 overlay 自己畫「原文上 / 譯文下」兩行,不再借用原生英文 CC,
+  // 所以 bilingual 與純中文都統一走隱藏原生 CC 的模式,避免三層字幕重疊。
   function _ensureAsrStylesheet() {
     if (document.getElementById(_ASR_HIDE_CSS_ID)) return;
     const style = document.createElement('style');
@@ -1033,15 +1155,6 @@
       .html5-video-player:not(.ytp-autohide) ${_OVERLAY_TAG} {
         --sk-cue-bottom: calc(60px + var(--sk-cue-size, 22px));
       }
-      /* commit 5c.6:雙語模式(host[bilingual] attr)overlay 從預設 30px 推到 90px
-         避開原生英文 CC(原生 30-40px from bottom)。chrome 顯示時再多推一段
-         避開控制列 + 已上抬的原生 CC(YouTube 自己把原生 CC 推到約 82px)。 */
-      ${_OVERLAY_TAG}[bilingual] {
-        --sk-cue-bottom: 90px;
-      }
-      .html5-video-player:not(.ytp-autohide) ${_OVERLAY_TAG}[bilingual] {
-        --sk-cue-bottom: calc(140px + var(--sk-cue-size, 22px));
-      }
     `;
     document.head.appendChild(style);
   }
@@ -1057,15 +1170,10 @@
     }
   }
 
-  // commit 5c:統一切 bilingualMode 的副作用 — 字幕隱藏/顯示 + overlay 位置調整。
-  // 雙語模式中文 overlay 要避開原生英文 CC(原生位置約 30-40px from bottom),把
-  // overlay --sk-cue-bottom 推到 90px 在英文上方。純中文模式(原生 CC 已隱藏)
-  // overlay 回預設 30px 佔據原生 CC 的視覺位置。
+  // commit 5c:統一切 bilingualMode 的副作用。
+  // v1.8.25:ASR 雙語改由 overlay 自己渲染兩行(原文上 / 譯文下),因此不再顯示原生 CC。
   function _applyBilingualMode(bilingual) {
-    _setAsrHidingMode(!bilingual);
-    // commit 5c.6:用 host attribute + CSS rule(_setAsrHidingMode 內注入的 stylesheet)
-    // 控制 overlay 位置,讓 chrome 顯示時的 :not(.ytp-autohide) selector 可以再上抬,
-    // 避免 inline style override 卡住自動上抬邏輯。
+    _setAsrHidingMode(true);
     const host = document.querySelector(_OVERLAY_TAG);
     if (host) {
       if (bilingual) {
@@ -1079,6 +1187,8 @@
     // commit 5c.3:即時切到雙語時把已顯示的「翻譯中…」清掉(雙語下這 status 不該存在)
     if (bilingual) hideCaptionStatus();
   }
+
+  SK._applyBilingualModeForTest = _applyBilingualMode;
 
   // 讀 YouTube 原生字幕字體大小(已套用使用者字幕設定 + player size 自適應比例)。
   // 多重 fallback:首選 caption-segment、退而 caption-window、最後用 video 高度 4.5%。
@@ -1153,8 +1263,20 @@
     // L1934 的 hideCaptionStatus → 「翻譯中…」永遠殘留。改在 overlay 寫入時若有
     // 中文 cue 命中,就主動 hide(冪等,沒 status indicator 時直接 return)。
     if (cue && cue.targetText) hideCaptionStatus();
-    _setOverlayContent(cue ? cue.targetText : '');
+    const usePagePanel = _shouldUsePageSubtitlePanel();
+    if (usePagePanel) {
+      // 頁面面板不像 overlay 會遮畫面；若下一句翻譯尚未到位，保留上一句避免使用者看到
+      // 「英文還在播，但下方面板瞬間清空」的體感。
+      if (cue && cue.targetText) {
+        _setPageSubtitleContent(cue.targetText, cue.sourceText);
+      }
+      _setOverlayContent('', '');
+      return;
+    }
+    _setOverlayContent(cue ? cue.targetText : '', cue ? cue.sourceText : '');
   }
+
+  SK._updateOverlayForTest = _updateOverlay;
 
   // 中文閱讀時間補償:LLM 自由分句把多段 ASR 合成一句中文,中文密度高,
   // 原 endMs(=該句最後一個 ASR 片段的 startMs)往往讓使用者讀不完。
@@ -2066,16 +2188,12 @@
 
   function replaceSegmentEl(el) {
     if (!SK.YT.active) return;
-    // commit 5c.2:ASR 路徑雙語模式下保留英文 segment(中文由 overlay 顯示),否則
-    // overlay 中文 + segment 中文 = 三層觀感(image 20)
-    // commit 5c.4:非 ASR 路徑(人工字幕)沒有 G overlay,雙語應走「英文 + 譯文兩行」
-    // 寫進 segment 的設計;單純 return 會只剩英文(image 22 bug)。所以只 gate ASR。
-    if (SK.YT.config?.bilingualMode === true && SK.YT.isAsr === true) return;
     const original = el.textContent.trim();
     if (!original) return;
     // 已含中日韓字元 → 這是我們設置的譯文被 characterData mutation 觸發回呼，直接跳過
     if (RE_CJK.test(original)) return;
     const key = normText(original);
+    const usePagePanel = _syncSubtitlePresentationMode();
 
     // 快取命中 → 瞬間替換
     const cached = SK.YT.captionMap.get(key);
@@ -2101,6 +2219,10 @@
         // 對英文寬鬆但對中文常硬切兩行(image 22:中文長句被切,英文沒切)。直接寫
         // innerHTML + <br>,讓 caption-window 的 CSS word-wrap 依實際容器寬度自然處理。
         const isBilingual = SK.YT.config?.bilingualMode === true;
+        if (usePagePanel && cached) {
+          _setPageSubtitleContent(cached, original);
+          return;
+        }
         if (isBilingual && cached) {
           const html = `${_escapeHtml(original)}<br>${_escapeHtml(cached)}`;
           if (el.innerHTML !== html) el.innerHTML = html;
@@ -2178,6 +2300,7 @@
       // v1.2.39: 累積並記錄 on-the-fly 批次用量
       _logWindowUsage(texts.length, res.usage);
 
+      const usePagePanel = _syncSubtitlePresentationMode();
       for (let i = 0; i < texts.length; i++) {
         const key = texts[i];
         // v1.8.10 A:strip LLM 偷懶殘留的 SEP / «N» 標記
@@ -2188,6 +2311,11 @@
             // commit 5c.4:雙語模式(非 ASR)寫「原文 + 譯文兩行」
             // commit 5c.5:雙語跳過 _wrapTargetText,讓 CSS word-wrap 自然處理
             const isBilingual = YT.config?.bilingualMode === true;
+            if (usePagePanel && trans) {
+              const original = el.textContent.trim();
+              _setPageSubtitleContent(trans, original);
+              continue;
+            }
             if (isBilingual && trans) {
               const original = el.textContent.trim();
               const html = `${_escapeHtml(original)}<br>${_escapeHtml(trans)}`;
@@ -2313,6 +2441,7 @@
     YT.displayCues        = [];         // G 路徑:清 overlay 顯示單位
     _setAsrHidingMode(false);
     _removeOverlay();
+    _removePageSubtitlePanel();
     hideCaptionStatus(); // v1.2.55
     _debugRemove();
     SK.sendLog('info', 'youtube', 'stopped');
@@ -2435,6 +2564,7 @@
     YT.displayCues        = [];             // G 路徑:SPA nav 清 overlay 顯示單位
     _setAsrHidingMode(false);
     _removeOverlay();
+    _removePageSubtitlePanel();
     YT.config             = null;
     YT.videoId            = getVideoIdFromUrl();
     SK.sendLog('info', 'youtube', 'SPA navigation reset', { wasActive, newVideoId: YT.videoId });
@@ -2475,11 +2605,20 @@
     const newVal = changes.ytSubtitle.newValue || {};
     const newBilingual = newVal.bilingualMode === true;
     if (SK.YT.config) SK.YT.config.bilingualMode = newBilingual;
-    // 只在 ASR 字幕已啟用時即時 reapply(避免 ASR 還沒啟動就動 player class)
-    if (SK.YT.isAsr && SK.YT.active) {
-      _applyBilingualMode(newBilingual);
-      SK.sendLog('info', 'youtube', 'bilingualMode toggled live', { bilingual: newBilingual });
+    if (SK.YT.active) {
+      if (SK.YT.isAsr) _applyBilingualMode(newBilingual);
+      _syncSubtitlePresentationMode();
+      SK.sendLog('info', 'youtube', 'bilingualMode toggled live', {
+        bilingual: newBilingual,
+        isAsr: SK.YT.isAsr === true,
+      });
     }
+  });
+
+  document.addEventListener('fullscreenchange', () => {
+    if (!SK.YT.active) return;
+    _syncSubtitlePresentationMode();
+    if (SK.YT.isAsr) _updateOverlay();
   });
 
   // ─── 對外 export:給 content-drive.js(Drive ASR commit 3+)共用 ─────
