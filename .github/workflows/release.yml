@@ -22,9 +22,8 @@ jobs:
         run: |
           zip -r shinkansen-${{ steps.version.outputs.VERSION }}.zip shinkansen/
           cp shinkansen-${{ steps.version.outputs.VERSION }}.zip shinkansen.zip
-          # Firefox 128+ beta：內容與 Chrome ZIP 完全相同（manifest 同時宣告
-          # background.service_worker 與 background.scripts，Chrome / Firefox 各取所需），
-          # 只是檔名標 firefox + beta 方便使用者識別、debug 用。
+          # Firefox beta 目前沿用同一份 MV3 產物；背景程序維持標準
+          # background.service_worker，避免帶入 Chrome 會拒絕的 background.scripts。
           cp shinkansen-${{ steps.version.outputs.VERSION }}.zip shinkansen-firefox-${{ steps.version.outputs.VERSION }}-beta.zip
 
       - name: Create GitHub Release
